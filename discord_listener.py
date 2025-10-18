@@ -1,5 +1,4 @@
-import os, asyncio
-import discord
+import os, asyncio, discord
 from parser import parse_signal_from_text
 from execution import Executor
 
@@ -19,7 +18,7 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.channel.id != CHANNEL_ID:
         return
-    # We accept both embeds and raw content
+
     text = message.content or ""
     if message.embeds:
         for e in message.embeds:
@@ -31,10 +30,14 @@ async def on_message(message: discord.Message):
     if not sig:
         return
 
-    # Run execution in a thread to avoid blocking the Discord loop
+    # execute in a worker thread
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, executor.execute_signal_oto, sig.symbol, sig.side, sig.entry_band, sig.stop, sig.take_profits)
+    loop.run_in_executor(None, executor.execute_signal_oto, sig)
 
 def start():
+    if not TOKEN:
+        print("[FATAL] DISCORD_BOT_TOKEN is missing")
+        import sys; sys.exit(1)
+    if CHANNEL_ID == 0:
+        print("[WARN] DISCORD_CHANNEL_ID is 0 (listener will ignore all messages)")
     client.run(TOKEN)
-
