@@ -1,104 +1,70 @@
-import os, time
-from typing import List
-from broker.hyperliquid import HyperliquidBroker
-from parser import Signal
+import os
+import asyncio
+import discord
 
-TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "100"))
-TP_WEIGHTS = [float(x) for x in os.getenv("TP_WEIGHTS", "0.10,0.15,0.15,0.20,0.20,0.20").split(",")]
-POLL_OPEN_ORDERS_SEC = int(os.getenv("POLL_OPEN_ORDERS_SEC", "20"))
-ENTRY_TIMEOUT_MIN = int(os.getenv("ENTRY_TIMEOUT_MIN", "120"))
-ACCOUNT_MODE = os.getenv("ACCOUNT_MODE", "perp").lower()
+from parser import parse_signal_from_text
+from execution import ExecSignal, execute_signal, is_symbol_allowed
 
-FORCE_LEVERAGE = float(os.getenv("FORCE_LEVERAGE", "0"))
-MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "0"))  # 0 = no cap
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
-def _qty_from_usd(price: float, usd: float) -> float:
-    if price <= 0:
-        raise ValueError("Invalid price")
-    return usd / price
+# Make sure we can read message content
+intents = discord.Intents.default()
+intents.message_content = True
 
-def _effective_leverage(sig_lev: float | None) -> float | None:
-    # priority: force -> cap -> signal
-    if FORCE_LEVERAGE and FORCE_LEVERAGE > 0:
-        return FORCE_LEVERAGE
-    lev = sig_lev if sig_lev and sig_lev > 0 else None
-    if lev and MAX_LEVERAGE and MAX_LEVERAGE > 0 and lev > MAX_LEVERAGE:
-        lev = MAX_LEVERAGE
-    return lev
+client = discord.Client(intents=intents)
 
-class Executor:
-    def __init__(self):
-        self.broker = HyperliquidBroker()
 
-    def execute_signal_oto(self, sig: Signal):
-        symbol = sig.symbol
-        if not self.broker.supports_symbol(symbol):
-            print(f"[EXEC] skip {symbol} — not listed on Hyperliquid")
-            return
-
-        is_long = sig.side.upper() == "LONG"
-        entry_price = (sig.entry_band[0] + sig.entry_band[1]) / 2.0
-        qty = _qty_from_usd(entry_price, TRADE_SIZE_USD)
-
-        entry_side = "buy" if is_long else "sell"
-        exit_side  = "sell" if is_long else "buy"
-        leverage   = _effective_leverage(sig.leverage)
-
-        # 1) place entry limit
-        entry_id = self.broker.place_limit(
-            symbol, entry_side, qty, entry_price, client_id=f"entry_{symbol}",
-            leverage=leverage
-        )
-
-        # 2) wait for fills; place children per fill delta
-        deadline = time.time() + ENTRY_TIMEOUT_MIN * 60
-        placed_for = 0.0
-
-        while time.time() < deadline:
-            filled = self.broker.filled_size(entry_id)
-            if filled > placed_for + 1e-12:
-                delta = filled - placed_for
-                # TPs (split by weights)
-                for i, price in enumerate(sig.take_profits[:len(TP_WEIGHTS)]):
-                    tp_qty = delta * TP_WEIGHTS[i]
-                    if tp_qty <= 0:
-                        continue
-                    self.broker.place_reduce_only_limit(
-                        symbol, exit_side, tp_qty, price,
-                        client_id=f"tp{i+1}_{symbol}", leverage=leverage
-                    )
-                # SL for the newly filled size
-                self.broker.place_stop(
-                    symbol, exit_side, delta, sig.stop,
-                    client_id=f"sl_{symbol}", leverage=leverage
-                )
-                placed_for += delta
-                if placed_for >= qty - 1e-12:
-                    break
-            time.sleep(POLL_OPEN_ORDERS_SEC)
-
-        if placed_for < qty - 1e-12:
-            # timeout: cancel stale entry
-            try:
-                self.broker.cancel_order(entry_id)
-            except Exception:
-                pass
-# execution.py  (add this)
-
-# If you already have an async function that places orders from a parsed Signal,
-# change the call below to point to it (examples shown in comments).
-
-async def execute_signal(sig):
-    """
-    Unified entrypoint the Discord listener will call.
-    Replace the body with your project's real function if needed.
-    """
-    # Examples of what you might already have:
-    # return await place_from_signal(sig)
-    # return await run_oto_signal(sig)
-    # return await process_signal(sig)
-
-    # Fallback — raise a clear error if you haven't wired it yet.
-    raise NotImplementedError(
-        "Add your real order-placement function call inside execute_signal(sig)"
+def _to_exec(signal):
+    # Convert parsed model -> ExecSignal the executor expects
+    return ExecSignal(
+        symbol=signal.symbol,               # 'ETH/USD'
+        side=signal.side,                   # 'LONG'|'SHORT'
+        entry_band=signal.entry_band,       # (lo, hi)
+        stop=signal.stop,
+        tps=signal.take_profits
     )
+
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user} and listening to channel {CHANNEL_ID}")
+
+
+@client.event
+async def on_message(message: discord.Message):
+    # Ignore other channels / self
+    if message.author == client.user:
+        return
+    if message.channel.id != CHANNEL_ID:
+        return
+
+    txt = message.content or ""
+    # include embeds text too (your VIP cards are embeds)
+    if message.embeds:
+        for e in message.embeds:
+            if e.description:
+                txt += f"\n{e.description}"
+            if e.title:
+                txt += f"\n{e.title}"
+            if e.fields:
+                for f in e.fields:
+                    txt += f"\n{f.name}\n{f.value}"
+
+    sig = parse_signal_from_text(txt)
+    if not sig:
+        return
+
+    # quick allow-list gate (accepts ETH/USD, ETH-USD, ETH)
+    if not is_symbol_allowed(sig.symbol):
+        print(f"[SKIP] {sig.symbol} not in allow list.")
+        return
+
+    res = execute_signal(_to_exec(sig))
+    print(f"[EXEC] {sig.symbol} {sig.side} -> {res}")
+
+
+def start():
+    if not TOKEN or CHANNEL_ID == 0:
+        raise RuntimeError("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID missing.")
+    client.run(TOKEN)
