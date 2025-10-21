@@ -1,4 +1,3 @@
-# main.py
 from discord_listener import start
 
 if __name__ == "__main__":
