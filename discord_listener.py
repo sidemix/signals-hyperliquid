@@ -1,120 +1,130 @@
-# discord_listener.py (super-verbose)
+# discord_listener.py
 import os
-import textwrap
+import asyncio
+import re
 import discord
 
 from parser import parse_signal_from_text
 from execution import ExecSignal, execute_signal, is_symbol_allowed
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+# ---- Config from env ----
+DISCORD_TOKEN     = os.environ["DISCORD_BOT_TOKEN"]
+TARGET_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
+# Optional: only accept messages from this user id (int). Leave empty to accept anyone.
+AUTHOR_ID_ENV     = os.getenv("AUTHOR_ID", "").strip()
+ONLY_AUTHOR_ID    = int(AUTHOR_ID_ENV) if AUTHOR_ID_ENV.isdigit() else None
 
-intents = discord.Intents.default()
-intents.message_content = True  # must also be enabled in Dev Portal
-client = discord.Client(intents=intents)
+def _log(msg: str):
+    print(msg, flush=True)
 
+def _norm_symbol_to_hl(s: str) -> str:
+    # VIP feed uses XXX/USD while HL takes the same; keep as-is.
+    return s.strip().upper().replace("USDT", "USD")
 
-def _short(s: str, n: int = 300) -> str:
-    s = s.replace("\r", " ").replace("\n", " ").strip()
-    return (s[: n - 1] + "…") if len(s) > n else s
-
-
-def _collect_text(message: discord.Message) -> str:
-    txt = message.content or ""
-    # add embed pieces too
-    for e in getattr(message, "embeds", []) or []:
-        if e.title:
-            txt += f"\n{e.title}"
-        if e.description:
-            txt += f"\n{e.description}"
-        for f in getattr(e, "fields", []) or []:
-            if f.name:
-                txt += f"\n{f.name}"
-            if f.value:
-                txt += f"\n{f.value}"
-    return txt.strip()
-
-
-def _to_exec(sig):
+def _signal_to_exec(sig) -> ExecSignal:
+    side = "buy" if sig.side.upper() == "LONG" else "sell"
     return ExecSignal(
-        symbol=sig.symbol,
-        side=sig.side,
-        entry_band=sig.entry_band,
+        symbol=_norm_symbol_to_hl(sig.symbol),
+        side=side,
+        entry_low=sig.entry_band[0],
+        entry_high=sig.entry_band[1],
         stop=sig.stop,
         tps=sig.take_profits,
+        leverage=sig.leverage,
+        timeframe=sig.timeframe or "",
     )
 
+# -------- Discord client (make sure we request message content!) --------
+intents = discord.Intents.default()
+intents.message_content = True          # <-- critical
+intents.guilds = True
+intents.members = False
+
+client = discord.Client(intents=intents)
 
 @client.event
 async def on_ready():
-    print(f"[READY] Logged in as {client.user} | target CHANNEL_ID={CHANNEL_ID}", flush=True)
-
-    # Try to fetch the channel and send a hello (helps verify perms + id)
     try:
-        ch = client.get_channel(CHANNEL_ID)
-        if ch is None:
-            print("[READY] get_channel returned None; attempting fetch_channel()", flush=True)
-            ch = await client.fetch_channel(CHANNEL_ID)
-        print(f"[READY] Resolved channel: {type(ch).__name__} id={getattr(ch,'id',None)} "
-              f"name={getattr(ch,'name',None)} parent_id={getattr(ch,'parent_id',None)}", flush=True)
-        try:
-            await ch.send("👋 Bot online (debug). I can read this channel.")
-            print("[READY] Sent hello message successfully.", flush=True)
-        except Exception as e:
-            print(f"[READY] Could not send hello message: {e}", flush=True)
+        channel = client.get_channel(TARGET_CHANNEL_ID)
+        _log(f"[READY] Logged in as {client.user} | target CHANNEL_ID={TARGET_CHANNEL_ID}")
+        if channel is None:
+            _log("[READY] Could not resolve channel object (None). "
+                 "Check DISCORD_CHANNEL_ID and that the bot is in the same server.")
+        else:
+            _log(f"[READY] Resolved channel: {channel} "
+                 f"type={getattr(channel, 'type', None)} parent_id={getattr(channel, 'category_id', None)}")
+            # Say hello so we know we can write
+            try:
+                await channel.send("👋 Bot online (debug). I can read this channel.")
+                _log("[READY] Sent hello message successfully.")
+            except Exception as e:
+                _log(f"[READY] Could not send hello message: {e}")
     except Exception as e:
-        print(f"[READY] Channel resolve failed: {e}", flush=True)
-
+        _log(f"[READY] on_ready error: {e}")
 
 @client.event
 async def on_message(message: discord.Message):
-    # Log *every* message we receive before filtering
+    # Log everything we get so we can see what Discord is delivering
     try:
-        gid = getattr(getattr(message.channel, "guild", None), "id", None)
-        pname = getattr(getattr(message.channel, "parent", None), "name", None)
-        print(
-            f"[RX] msg_id={message.id} author='{getattr(message.author,'name','?')}' "
-            f"chan_id={message.channel.id} chan_name={getattr(message.channel,'name',None)} "
-            f"type={type(message.channel).__name__} parent_id={getattr(message.channel,'parent_id',None)} "
-            f"guild_id={gid} len={len(message.content or '')}",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"[RX] pre-log error: {e}", flush=True)
+        _log(f"[RX] msg_id={message.id} author='{message.author}' "
+             f"chan_id={message.channel.id} chan_name={getattr(message.channel, 'name', None)} "
+             f"type={getattr(message.channel, 'type', None)} "
+             f"parent_id={getattr(getattr(message.channel, 'category', None), 'id', None)} "
+             f"guild_id={getattr(getattr(message.guild, 'id', None), '__str__', lambda: None)() if message.guild else None} "
+             f"len={len(message.content or '')}")
+    except Exception:
+        pass
 
-    # Ignore ourselves
-    if message.author == client.user:
-        print("[DROP] our own message", flush=True)
+    # Ignore our own messages to avoid loops
+    if message.author.id == client.user.id:
+        _log("[DROP] our own message")
         return
 
-    # Accept messages in the configured channel...
-    in_channel = (message.channel.id == CHANNEL_ID)
-    # ...or in any thread whose parent is the configured channel
-    parent_id = getattr(message.channel, "parent_id", None)
-    in_thread = (parent_id == CHANNEL_ID)
-
-    if not (in_channel or in_thread):
-        print(f"[DROP] not target channel/thread (CHANNEL_ID={CHANNEL_ID})", flush=True)
+    # Only watch the configured channel
+    if message.channel.id != TARGET_CHANNEL_ID:
+        _log(f"[DROP] wrong channel: {message.channel.id}")
         return
 
-    where = "channel" if in_channel else f"thread<{message.channel.id}>"
-    txt = _collect_text(message)
-    print(f"[PASS] from '{getattr(message.author,'name','?')}' in {where}: {_short(txt)}", flush=True)
+    # Optional author filter
+    if ONLY_AUTHOR_ID is not None and message.author.id != ONLY_AUTHOR_ID:
+        _log(f"[DROP] author not allowed (msg_author_id={message.author.id} != ONLY_AUTHOR_ID={ONLY_AUTHOR_ID})")
+        return
 
-    sig = parse_signal_from_text(txt)
+    text = message.content or ""
+    if not text.strip():
+        _log("[DROP] empty content (likely only embeds/attachments)")
+        return
+
+    # Try to parse the VIP signal text
+    sig = parse_signal_from_text(text)
     if not sig:
-        print("[PARSE] no match", flush=True)
+        _log("[PARSE] No signal pattern matched this message.")
         return
 
-    if not is_symbol_allowed(sig.symbol):
-        print(f"[SKIP] {sig.symbol} not allowed by HYPER_ONLY_EXECUTE_SYMBOLS", flush=True)
+    # Check symbol allow list (HYPER_ONLY_EXECUTE_SYMBOLS) before trading
+    hl_symbol = _norm_symbol_to_hl(sig.symbol)
+    if not is_symbol_allowed(hl_symbol):
+        _log(f"[SKIP] Symbol '{hl_symbol}' not in HYPER_ONLY_EXECUTE_SYMBOLS (or allow list is empty).")
         return
 
-    res = execute_signal(_to_exec(sig))
-    print(f"[EXEC] {sig.symbol} {sig.side} -> {res}", flush=True)
-
+    try:
+        ex = _signal_to_exec(sig)
+        _log(f"[EXEC] {ex.side.upper()} {ex.symbol} "
+             f"entry {ex.entry_low}–{ex.entry_high} SL {ex.stop} "
+             f"TPs {ex.tps} lev={ex.leverage or 'default'} tf={ex.timeframe or ''}")
+        ok, resp = execute_signal(ex)
+        if ok:
+            await message.add_reaction("✅")
+            _log(f"[OK] order placed: {resp}")
+        else:
+            await message.add_reaction("⚠️")
+            _log(f"[ERR] order rejected: {resp}")
+    except Exception as e:
+        _log(f"[EXC] execution error: {e}")
+        try:
+            await message.add_reaction("❌")
+        except Exception:
+            pass
 
 def start():
-    if not TOKEN or CHANNEL_ID == 0:
-        raise RuntimeError("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID missing.")
-    client.run(TOKEN)
+    client.run(DISCORD_TOKEN)
