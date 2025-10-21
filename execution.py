@@ -83,3 +83,22 @@ class Executor:
                 self.broker.cancel_order(entry_id)
             except Exception:
                 pass
+# execution.py  (add this)
+
+# If you already have an async function that places orders from a parsed Signal,
+# change the call below to point to it (examples shown in comments).
+
+async def execute_signal(sig):
+    """
+    Unified entrypoint the Discord listener will call.
+    Replace the body with your project's real function if needed.
+    """
+    # Examples of what you might already have:
+    # return await place_from_signal(sig)
+    # return await run_oto_signal(sig)
+    # return await process_signal(sig)
+
+    # Fallback — raise a clear error if you haven't wired it yet.
+    raise NotImplementedError(
+        "Add your real order-placement function call inside execute_signal(sig)"
+    )
