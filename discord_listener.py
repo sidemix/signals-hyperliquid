@@ -1,116 +1,100 @@
+# discord_listener.py
 import os
 import asyncio
-import inspect
+import logging
 import discord
 
 from parser import parse_signal_from_text
-import execution as _exec  # we'll pick the right function from here dynamically
+from execution import execute_signal, is_symbol_allowed
 
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0") or "0")
-DEBUG = str(os.getenv("DEBUG", "")).lower() in ("1", "true", "yes", "on")
+TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
-
-def _log(msg: str):
-    if DEBUG:
-        print(f"[listener] {msg}", flush=True)
-
-
-# ---- find an executable function inside execution.py ----
-_CANDIDATES = (
-    "execute_signal",        # our preferred entrypoint
-    "handle_signal",
-    "run_signal",
-    "place_from_signal",
-    "process_signal",
-    "run_oto_signal",
+# Very talkative logs by default
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-EXECUTE_FN = None
-for _name in _CANDIDATES:
-    if hasattr(_exec, _name):
-        EXECUTE_FN = getattr(_exec, _name)
-        _log(f"using execution function: execution.{_name}")
-        break
+log = logging.getLogger("signals-bot")
 
-if EXECUTE_FN is None:
-    raise ImportError(
-        "discord_listener: no execution function found in execution.py. "
-        f"Tried: {', '.join(_CANDIDATES)}. "
-        "Export one of these or `execute_signal(sig)`."
+intents = discord.Intents.default()
+# THIS IS CRITICAL: without it, on_message will not fire with the content
+intents.message_content = True
+intents.guilds = True
+intents.messages = True
+
+_client = discord.Client(intents=intents)
+
+def _extract_text(msg: discord.Message) -> str:
+    """Return plain text + any embed text so our parser can see everything."""
+    parts = []
+    if msg.content:
+        parts.append(msg.content)
+
+    for em in msg.embeds or []:
+        if em.title:
+            parts.append(str(em.title))
+        if em.description:
+            parts.append(str(em.description))
+        if em.fields:
+            for f in em.fields:
+                # "Name: BTC/USD" style fields will be picked up
+                parts.append(f"{f.name}: {f.value}")
+
+        # Some bots put numbers in footer
+        if em.footer and em.footer.text:
+            parts.append(str(em.footer.text))
+
+    return "\n".join(parts).strip()
+
+@_client.event
+async def on_ready():
+    log.info("Logged in as %s and listening to channel %s", _client.user, CHANNEL_ID)
+
+@_client.event
+async def on_message(message: discord.Message):
+    # Ignore ourselves
+    if message.author == _client.user:
+        return
+
+    # Wrong channel? Log and skip silently
+    if message.channel.id != CHANNEL_ID:
+        return
+
+    text = _extract_text(message)
+    if not text:
+        log.info("Message in channel %s had no text/embeds; skipping.", CHANNEL_ID)
+        return
+
+    log.info("Message received (%d chars).", len(text))
+    sig = parse_signal_from_text(text)
+
+    if not sig:
+        log.info("Parse failed — message does not look like a VIP card.")
+        return
+
+    log.info(
+        "Parsed signal: symbol=%s side=%s entry=%s stop=%.6f tps=%s lev=%s tf=%s",
+        sig.symbol,
+        sig.side,
+        sig.entry_band,
+        sig.stop,
+        [round(x, 6) for x in sig.take_profits],
+        sig.leverage,
+        sig.timeframe,
     )
 
+    if not is_symbol_allowed(sig.symbol):
+        log.info("Symbol %s not in HYPER_ONLY_EXECUTE_SYMBOLS; skipping.", sig.symbol)
+        return
 
-def _extract_text_from_message(message: discord.Message) -> str:
-    parts = []
-    if message.content:
-        parts.append(message.content)
-    for emb in message.embeds or []:
-        if emb.title:
-            parts.append(emb.title)
-        if emb.description:
-            parts.append(emb.description)
-        for f in emb.fields or []:
-            if f.name:
-                parts.append(str(f.name))
-            if f.value:
-                parts.append(str(f.value))
-        try:
-            ft = getattr(emb.footer, "text", None)
-            if ft:
-                parts.append(ft)
-        except Exception:
-            pass
-    return "\n".join(p for p in parts if p)
-
-
-class SignalClient(discord.Client):
-    async def on_ready(self):
-        print(
-            f"Logged in as {self.user} and listening to channel {DISCORD_CHANNEL_ID}",
-            flush=True,
-        )
-
-    async def on_message(self, message: discord.Message):
-        # right channel?
-        if not DISCORD_CHANNEL_ID or message.channel.id != DISCORD_CHANNEL_ID:
-            return
-        # ignore our own posts
-        if message.author == self.user:
-            return
-
-        raw = _extract_text_from_message(message)
-        if not raw.strip():
-            _log("skip: empty message/embeds")
-            return
-
-        sig = parse_signal_from_text(raw)
-        if not sig:
-            _log("skip: parser returned None (format didn’t match)")
-            return
-
-        _log(
-            f"parsed: {sig.symbol} {sig.side} entry={sig.entry_band} "
-            f"sl={sig.stop} tps={sig.take_profits[:3]}..."
-        )
-
-        try:
-            if inspect.iscoroutinefunction(EXECUTE_FN):
-                await EXECUTE_FN(sig)
-            else:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, EXECUTE_FN, sig)
-        except Exception as e:
-            _log(f"execute error: {e}")
-
+    try:
+        await execute_signal(sig)
+        log.info("Execution submitted for %s.", sig.symbol)
+    except Exception as e:
+        log.exception("Execution error: %s", e)
 
 def start():
-    """Entry point used by main.py"""
-    intents = discord.Intents.default()
-    intents.message_content = True  # also enable this in the Discord Dev Portal
-    client = SignalClient(intents=intents)
-    client.run(DISCORD_BOT_TOKEN)
-
-
-if __name__ == "__main__":
-    start()
-
+    if not TOKEN or not CHANNEL_ID:
+        raise RuntimeError("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID missing.")
+    _client.run(TOKEN)
