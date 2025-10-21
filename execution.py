@@ -1,133 +1,71 @@
 # execution.py
-"""
-Execution layer for Hyperliquid auto-trader.
-
-- Defines ExecSignal (uses entry_band=(low, high)).
-- Provides make_exec_signal(...) for backward-compat construction.
-- Exposes async execute_signal(exec_sig) which delegates to the broker layer.
-"""
-
 from __future__ import annotations
-
 import os
-import asyncio
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Literal, Callable, Any, Awaitable
-import inspect
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional
 
-
-# ---------- Data model ----------
-
+# --------- Public dataclass used across the app ----------
 @dataclass
 class ExecSignal:
-    symbol: str                           # e.g., "ETH/USD"
-    side: Literal["LONG", "SHORT"]
-    entry_band: Tuple[float, float]       # (low, high)
+    symbol: str                      # "ETH/USD"
+    side: str                        # "LONG" | "SHORT"
+    entry_band: Tuple[float, float]  # (low, high)
     stop: float
     tps: List[float]
-    leverage: Optional[float] = None      # e.g., 20
-    timeframe: Optional[str] = None       # e.g., "5m"
+    leverage: Optional[float] = None
+    timeframe: Optional[str] = None
 
+# --------- Simple allowlist helpers ----------
+def _split_csv(env_name: str) -> list[str]:
+    raw = os.getenv(env_name, "") or ""
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
 
-def make_exec_signal(**kwargs) -> ExecSignal:
+def is_author_allowed(author: str) -> bool:
+    wl = _split_csv("AUTHOR_ALLOWLIST")
+    if not wl:
+        return True
+    return author.strip().lower() in (x.lower() for x in wl)
+
+def is_symbol_allowed(symbol: str) -> bool:
+    # We expect allowlist like "BTC,ETH,SOL"
+    wl = _split_csv("HYPER_ONLY_EXECUTE_SYMBOLS")
+    if not wl:
+        return True
+    coin = symbol.split("/")[0].upper()
+    return coin in {x.upper() for x in wl}
+
+# --------- Main entry used by discord_listener ----------
+def execute_signal(sig: ExecSignal) -> None:
     """
-    Backward-compatible constructor.
-
-    Accepts either:
-      - entry_band=(low, high)    OR
-      - entry_low=..., entry_high=...
-
-    Any extra supported ExecSignal fields are passed through.
+    Called by discord_listener after parsing a VIP message.
+    Always forwards a dict payload to the broker to avoid signature mismatch.
     """
-    if "entry_band" in kwargs:
-        band = kwargs.pop("entry_band")
-    else:
-        # Support old callers that passed entry_low/entry_high
-        low = float(kwargs.pop("entry_low"))
-        high = float(kwargs.pop("entry_high"))
-        band = (low, high)
+    payload = asdict(sig)
 
-    return ExecSignal(entry_band=band, **kwargs)
-
-
-# ---------- Broker delegation ----------
-
-# We try to import a single entry-point from your broker layer.
-# Name it however you like; these are common choices.
-_BROKER_FUNCS: List[str] = [
-    "submit_signal",     # prefer this
-    "execute_signal",    # or this
-    "place_signal",      # or this
-]
-
-_broker_submit: Optional[Callable[..., Any]] = None
-try:
-    from broker import hyperliquid as _hl  # your repo typically has broker/hyperliquid.py
-
-    for fname in _BROKER_FUNCS:
-        if hasattr(_hl, fname):
-            _broker_submit = getattr(_hl, fname)
-            break
-except Exception:
-    _hl = None
-    _broker_submit = None
-
-
-def _dry_run() -> bool:
-    return str(os.getenv("DRY_RUN", "false")).strip().lower() in ("1", "true", "yes", "on")
-
-
-async def _maybe_await(func: Callable, *args, **kwargs):
-    """Call func; await it if it's a coroutine function or returns a coroutine."""
-    if inspect.iscoroutinefunction(func):
-        return await func(*args, **kwargs)
-    result = func(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-# ---------- Public API ----------
-
-async def execute_signal(sig: ExecSignal) -> None:
-    """
-    Execute the signal by delegating to the broker layer.
-    If DRY_RUN=true, only logs.
-
-    Broker function should accept one of:
-      - the ExecSignal object itself
-      - or the expanded fields (keyword args)
-    """
-    low, high = sig.entry_band
+    # Logging (keep concise)
     print(
-        f"[EXEC] {sig.side} {sig.symbol} band=({low:.6f}, {high:.6f}) "
-        f"SL={sig.stop:.6f} TPn={len(sig.tps)} lev={sig.leverage or 'n/a'} TF={sig.timeframe or 'n/a'}"
+        "[EXEC] {side} {sym} band=({lo:.6f}, {hi:.6f}) SL={sl:.6f} TPn={n} lev={lev} TF={tf}".format(
+            side=sig.side,
+            sym=sig.symbol,
+            lo=sig.entry_band[0],
+            hi=sig.entry_band[1],
+            sl=sig.stop,
+            n=len(sig.tps),
+            lev=sig.leverage if sig.leverage is not None else "n/a",
+            tf=sig.timeframe or "n/a",
+        ),
+        flush=True,
     )
 
-    if _dry_run():
-        print("[EXEC] DRY_RUN=true — not sending to exchange.")
-        return
-
-    if _broker_submit is None:
-        raise RuntimeError(
-            "No broker submission function found. "
-            "Implement one in broker/hyperliquid.py and export it as "
-            f"one of: {', '.join(_BROKER_FUNCS)}"
-        )
-
-    # Be generous with the broker signature: try (object) first, then kwargs.
+    # Import inside to avoid import cycles
     try:
-        await _maybe_await(_broker_submit, sig)
-        return
-    except TypeError:
-        # Fall back to kwargs
-        await _maybe_await(
-            _broker_submit,
-            symbol=sig.symbol,
-            side=sig.side,
-            entry_band=sig.entry_band,
-            stop=sig.stop,
-            tps=sig.tps,
-            leverage=sig.leverage,
-            timeframe=sig.timeframe,
-        )
+        from broker import hyperliquid as broker  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"Could not import broker.hyperliquid: {e}")
+
+    # Call the broker with a SINGLE dict arg (never bare **kwargs)
+    try:
+        broker.submit_signal(payload)  # <— important: pass one dict
+    except Exception as e:
+        raise RuntimeError(f"Broker submit failed: {e}")
