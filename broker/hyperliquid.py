@@ -1,111 +1,130 @@
-import os, time, functools
-from typing import Dict, Any, Optional, Set
-from .base import BrokerBase
 
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1","true","yes","on")
-BASE = os.getenv("HYPERLIQUID_BASE", "https://api.hyperliquid.xyz")
-ACCOUNT_MODE = os.getenv("ACCOUNT_MODE", "perp").lower()
+# broker/hyperliquid.py
+"""
+Hyperliquid broker shim used by execution.execute_signal().
 
-# ---- DRY-RUN emulation storage ----
-_emulated_orders: Dict[str, Dict[str, Any]] = {}
-_oid = 0
+It defines a single public entry-point:
+    submit_signal(exec_sig | **kwargs)
 
-def _mkid(prefix="ord") -> str:
-    global _oid
-    _oid += 1
-    return f"{prefix}_{int(time.time())}_{_oid}"
+execution.py will call this with either an ExecSignal object
+or with expanded keyword args. For now we:
+  - honor DRY_RUN=true (no orders, just logs)
+  - log a clear message showing the payload we would send
+  - provide one place (_place_order_real) to integrate your
+    actual Hyperliquid OTO bracket order code.
 
-# Optional symbol mapping for name mismatches
-SYMBOL_MAP = {
-    "1000BONK/USDT": "BONK/USDT",
-}
+Once you wire _place_order_real, real orders will be placed.
+"""
 
-def _normalize_for_hl(symbol: str) -> str:
-    return SYMBOL_MAP.get(symbol.upper(), symbol.upper())
+from __future__ import annotations
 
-class HyperliquidBroker(BrokerBase):
-    def __init__(self):
-        self.key = os.getenv("HYPER_API_KEY", "")
-        self.secret = os.getenv("HYPER_API_SECRET", "")
+import os
+from typing import Any, Dict, Iterable, Tuple, Union, List
 
-    # ---------- discovery / allow-list ----------
-    @functools.lru_cache(maxsize=1)
-    def list_symbols(self) -> Set[str]:
-        allow = os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "")
-        if allow.strip():
-            return {s.strip().upper() for s in allow.split(",") if s.strip()}
-        # If you want to auto-fetch markets, implement it here via HTTP and return a set
-        # For now, DRY defaults:
-        return {"BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","DOGE/USDT","LINK/USDT","ADA/USDT","AVAX/USDT"}
+try:
+    # For type hints only (no runtime dependency)
+    from execution import ExecSignal  # noqa
+except Exception:
+    ExecSignal = Any  # type: ignore
 
-    def supports_symbol(self, symbol: str) -> bool:
-        return _normalize_for_hl(symbol) in self.list_symbols()
 
-    # ---------- price ----------
-    def get_price(self, symbol: str) -> float:
-        # Implement price fetch if you want. For DRY, just return 1.0
-        return 1.0
+def _env_bool(key: str, default: bool = False) -> bool:
+    return str(os.getenv(key, "1" if default else "0")).strip().lower() in ("1", "true", "yes", "on")
 
-    # ---------- orders ----------
-    def place_limit(self, symbol: str, side: str, qty: float, price: float,
-                    client_id: str, leverage: Optional[float] = None) -> str:
-        symbol = _normalize_for_hl(symbol)
-        if DRY_RUN:
-            oid = _mkid("limit")
-            _emulated_orders[oid] = {
-                "status":"open","symbol":symbol,"side":side,"qty":qty,
-                "price":price,"filled":0.0,"client_id":client_id,"lev":leverage
-            }
-            print(f"[DRY] LIMIT {symbol} {side} {qty} @ {price} lev={leverage} -> {oid}")
-            return oid
-        # TODO: implement real REST call with auth to Hyperliquid
-        raise NotImplementedError("Implement Hyperliquid limit order")
 
-    def place_market(self, symbol: str, side: str, qty: float,
-                     client_id: str, leverage: Optional[float] = None) -> str:
-        symbol = _normalize_for_hl(symbol)
-        if DRY_RUN:
-            oid = _mkid("mkt")
-            _emulated_orders[oid] = {
-                "status":"filled","symbol":symbol,"side":side,"qty":qty,
-                "price":None,"filled":qty,"client_id":client_id,"lev":leverage
-            }
-            print(f"[DRY] MARKET {symbol} {side} {qty} lev={leverage} -> {oid} (filled)")
-            return oid
-        raise NotImplementedError("Implement Hyperliquid market order")
+def _normalize_payload(sig_or_kwargs: Union["ExecSignal", Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Return a dict payload with keys:
+      symbol, side, entry_band(tuple), stop, tps(list), leverage, timeframe
+    """
+    if isinstance(sig_or_kwargs, dict):
+        symbol = sig_or_kwargs["symbol"]
+        side = sig_or_kwargs["side"]
+        band = sig_or_kwargs.get("entry_band") or (sig_or_kwargs["entry_low"], sig_or_kwargs["entry_high"])
+        stop = float(sig_or_kwargs["stop"])
+        tps  = list(sig_or_kwargs["tps"])
+        lev  = sig_or_kwargs.get("leverage")
+        tf   = sig_or_kwargs.get("timeframe")
+    else:
+        s = sig_or_kwargs  # ExecSignal
+        symbol, side = s.symbol, s.side
+        band = s.entry_band
+        stop = float(s.stop)
+        tps  = list(s.tps)
+        lev  = s.leverage
+        tf   = s.timeframe
 
-    def place_reduce_only_limit(self, symbol: str, side: str, qty: float, price: float,
-                                client_id: str, leverage: Optional[float] = None) -> str:
-        # On spot, reduce-only isn't a concept; executor ensures sizing. For perps, you'd set reduceOnly=true
-        return self.place_limit(symbol, side, qty, price, client_id, leverage)
+    low, high = float(band[0]), float(band[1])
+    return {
+        "symbol": str(symbol).upper(),
+        "side": side.upper(),
+        "entry_band": (low, high),
+        "stop": stop,
+        "tps": tps,
+        "leverage": lev,
+        "timeframe": tf,
+    }
 
-    def place_stop(self, symbol: str, side: str, qty: float, stop_price: float,
-                   client_id: str, leverage: Optional[float] = None) -> str:
-        symbol = _normalize_for_hl(symbol)
-        if DRY_RUN:
-            oid = _mkid("stop")
-            _emulated_orders[oid] = {
-                "status":"open","symbol":symbol,"side":side,"qty":qty,
-                "stop":stop_price,"client_id":client_id,"lev":leverage
-            }
-            print(f"[DRY] STOP  {symbol} {side} {qty} stop={stop_price} lev={leverage} -> {oid}")
-            return oid
-        raise NotImplementedError("Implement Hyperliquid stop/trigger")
 
-    def order_status(self, order_id: str) -> Dict[str, Any]:
-        if DRY_RUN:
-            return _emulated_orders.get(order_id, {"status":"unknown"})
-        raise NotImplementedError("Implement Hyperliquid order_status")
+def _dry_run() -> bool:
+    return _env_bool("DRY_RUN", False)
 
-    def cancel_order(self, order_id: str) -> None:
-        if DRY_RUN:
-            if order_id in _emulated_orders:
-                _emulated_orders[order_id]["status"] = "canceled"
-                print(f"[DRY] CANCEL {order_id}")
-            return
-        raise NotImplementedError("Implement Hyperliquid cancel_order")
 
-    def filled_size(self, order_id: str) -> float:
-        if DRY_RUN:
-            return _emulated_orders.get(order_id, {}).get("filled", 0.0)
-        raise NotImplementedError("Implement Hyperliquid filled_size")
+def _log_preview(payload: Dict[str, Any]) -> None:
+    sym = payload["symbol"]
+    side = payload["side"]
+    low, high = payload["entry_band"]
+    print(
+        f"[BROKER] {side} {sym} band=({low:.6f},{high:.6f}) "
+        f"SL={payload['stop']:.6f} TPn={len(payload['tps'])} "
+        f"lev={payload.get('leverage') or 'n/a'} TF={payload.get('timeframe') or 'n/a'}"
+    )
+
+
+# ---------- PLACEHOLDER you will wire to your real HL code ----------
+def _place_order_real(payload: Dict[str, Any]) -> None:
+    """
+    Put your actual Hyperliquid placement code here.
+
+    Typical steps:
+      1) map "ETH/USD" -> coin "ETH", perp market
+      2) compute size from TRADE_SIZE_USD / mark price
+      3) post entry limit(s) in the provided band (or mid)
+      4) post OTO: one stop loss + take-profit ladder
+
+    If you already have code in this repo to place OTO orders,
+    import and call it here with this normalized payload.
+    """
+    # Example hook if you already have something like:
+    # from .place_oto import place_bracket
+    # place_bracket(payload)
+    raise NotImplementedError(
+        "Wire your real Hyperliquid order placement here "
+        "(sign + POST). For now, set DRY_RUN=true to preview."
+    )
+
+
+# ---------- Public entry used by execution.execute_signal ----------
+
+def submit_signal(sig_or_kwargs: Union["ExecSignal", Dict[str, Any]], **kw) -> None:
+    """
+    Main entry-point expected by execution.py.
+    Accepts either an ExecSignal object or the expanded kwargs.
+    """
+    # Merge kwargs if caller used submit_signal(**kwargs)
+    payload = _normalize_payload(sig_or_kwargs if kw == {} else {**sig_or_kwargs, **kw})  # type: ignore[arg-type]
+
+    _log_preview(payload)
+
+    if _dry_run():
+        print("[BROKER] DRY_RUN=true — not sending to exchange.")
+        return
+
+    # Basic sanity check for required secrets (adapt names to your signer)
+    api_key = os.getenv("HYPER_API_KEY", "")
+    api_secret = os.getenv("HYPER_API_SECRET", "")
+    if not api_key or not api_secret:
+        raise RuntimeError("HYPER_API_KEY / HYPER_API_SECRET missing. Set them or enable DRY_RUN=true.")
+
+    # Call your actual placement function
+    _place_order_real(payload)
