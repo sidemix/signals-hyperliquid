@@ -1,130 +1,139 @@
 # discord_listener.py
+"""
+Discord ingestion for VIP signals.
+
+- Listens to a single channel (DISCORD_CHANNEL_ID).
+- Parses each message with parser.parse_signal_from_text.
+- Applies allow-list (HYPER_ONLY_EXECUTE_SYMBOLS) if provided.
+- Builds ExecSignal using entry_band and calls execute_signal(...).
+"""
+
+from __future__ import annotations
+
 import os
 import asyncio
-import re
 import discord
+from typing import Set
 
 from parser import parse_signal_from_text
-from execution import ExecSignal, execute_signal, is_symbol_allowed
+from execution import ExecSignal, execute_signal
 
-# ---- Config from env ----
-DISCORD_TOKEN     = os.environ["DISCORD_BOT_TOKEN"]
-TARGET_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
-# Optional: only accept messages from this user id (int). Leave empty to accept anyone.
-AUTHOR_ID_ENV     = os.getenv("AUTHOR_ID", "").strip()
-ONLY_AUTHOR_ID    = int(AUTHOR_ID_ENV) if AUTHOR_ID_ENV.isdigit() else None
 
-def _log(msg: str):
-    print(msg, flush=True)
+# ---------- Env / allow list ----------
 
-def _norm_symbol_to_hl(s: str) -> str:
-    # VIP feed uses XXX/USD while HL takes the same; keep as-is.
-    return s.strip().upper().replace("USDT", "USD")
+def _env_bool(key: str, default: bool = False) -> bool:
+    return str(os.getenv(key, "1" if default else "0")).strip().lower() in ("1", "true", "yes", "on")
 
-def _signal_to_exec(sig) -> ExecSignal:
-    side = "buy" if sig.side.upper() == "LONG" else "sell"
-    return ExecSignal(
-        symbol=_norm_symbol_to_hl(sig.symbol),
-        side=side,
-        entry_low=sig.entry_band[0],
-        entry_high=sig.entry_band[1],
-        stop=sig.stop,
-        tps=sig.take_profits,
-        leverage=sig.leverage,
-        timeframe=sig.timeframe or "",
-    )
+TOKEN = os.getenv("DISCORD_BOT_TOKEN") or ""
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+ALLOW: Set[str] = {
+    s.strip().upper()
+    for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",")
+    if s.strip()
+}
 
-# -------- Discord client (make sure we request message content!) --------
+if not TOKEN:
+    raise RuntimeError("DISCORD_BOT_TOKEN is not set.")
+if CHANNEL_ID == 0:
+    raise RuntimeError("DISCORD_CHANNEL_ID is not set or invalid.")
+
+
+# ---------- Discord client ----------
+
 intents = discord.Intents.default()
-intents.message_content = True          # <-- critical
+intents.message_content = True
 intents.guilds = True
-intents.members = False
 
 client = discord.Client(intents=intents)
+
 
 @client.event
 async def on_ready():
     try:
-        channel = client.get_channel(TARGET_CHANNEL_ID)
-        _log(f"[READY] Logged in as {client.user} | target CHANNEL_ID={TARGET_CHANNEL_ID}")
-        if channel is None:
-            _log("[READY] Could not resolve channel object (None). "
-                 "Check DISCORD_CHANNEL_ID and that the bot is in the same server.")
-        else:
-            _log(f"[READY] Resolved channel: {channel} "
-                 f"type={getattr(channel, 'type', None)} parent_id={getattr(channel, 'category_id', None)}")
-            # Say hello so we know we can write
-            try:
-                await channel.send("👋 Bot online (debug). I can read this channel.")
-                _log("[READY] Sent hello message successfully.")
-            except Exception as e:
-                _log(f"[READY] Could not send hello message: {e}")
+        chan = await client.fetch_channel(CHANNEL_ID)
+        cname = getattr(chan, "name", "?")
+        parent = getattr(chan, "category_id", None) or getattr(chan, "parent_id", None)
+        print(f"[READY] Logged in as {client.user} | target CHANNEL_ID={CHANNEL_ID}")
+        print(f"[READY] Resolved channel: {cname} type={getattr(chan, 'type', None)} parent_id={parent}")
+        # Say hello (ok if fails)
+        try:
+            await chan.send("👋 Bot online (debug). I can read this channel.")
+            print("[READY] Sent hello message successfully.")
+        except Exception as e:
+            print(f"[READY] Could not send hello message: {e}")
     except Exception as e:
-        _log(f"[READY] on_ready error: {e}")
+        print(f"[READY] Error resolving channel: {e}")
+
+
+def _in_allow(symbol: str) -> bool:
+    if not ALLOW:
+        return True
+    return symbol.upper() in ALLOW
+
 
 @client.event
 async def on_message(message: discord.Message):
-    # Log everything we get so we can see what Discord is delivering
+    """
+    Ingest new messages, parse, filter, and execute.
+    """
     try:
-        _log(f"[RX] msg_id={message.id} author='{message.author}' "
-             f"chan_id={message.channel.id} chan_name={getattr(message.channel, 'name', None)} "
-             f"type={getattr(message.channel, 'type', None)} "
-             f"parent_id={getattr(getattr(message.channel, 'category', None), 'id', None)} "
-             f"guild_id={getattr(getattr(message.guild, 'id', None), '__str__', lambda: None)() if message.guild else None} "
-             f"len={len(message.content or '')}")
-    except Exception:
-        pass
+        # Ignore our own messages
+        if message.author == client.user or message.author.bot:
+            return
 
-    # Ignore our own messages to avoid loops
-    if message.author.id == client.user.id:
-        _log("[DROP] our own message")
-        return
+        # Only the configured channel
+        if message.channel.id != CHANNEL_ID:
+            return
 
-    # Only watch the configured channel
-    if message.channel.id != TARGET_CHANNEL_ID:
-        _log(f"[DROP] wrong channel: {message.channel.id}")
-        return
+        content = message.content or ""
+        author = str(message.author)
+        chan_name = getattr(message.channel, "name", "?")
+        print(
+            f"[RX] msg_id={message.id} author='{author}' "
+            f"chan_id={message.channel.id} chan_name={chan_name} "
+            f"type={getattr(message.channel, 'type', None)} "
+            f"parent_id={getattr(message.channel, 'category_id', None)} "
+            f"guild_id={getattr(message.guild, 'id', None)} len={len(content)}"
+        )
 
-    # Optional author filter
-    if ONLY_AUTHOR_ID is not None and message.author.id != ONLY_AUTHOR_ID:
-        _log(f"[DROP] author not allowed (msg_author_id={message.author.id} != ONLY_AUTHOR_ID={ONLY_AUTHOR_ID})")
-        return
+        sig = parse_signal_from_text(content)
+        if not sig:
+            print("[PARSE] no signal detected")
+            return
 
-    text = message.content or ""
-    if not text.strip():
-        _log("[DROP] empty content (likely only embeds/attachments)")
-        return
+        symbol = sig.symbol.upper()
 
-    # Try to parse the VIP signal text
-    sig = parse_signal_from_text(text)
-    if not sig:
-        _log("[PARSE] No signal pattern matched this message.")
-        return
+        if not _in_allow(symbol):
+            print(f"[SKIP] {symbol} not in allow-list")
+            return
 
-    # Check symbol allow list (HYPER_ONLY_EXECUTE_SYMBOLS) before trading
-    hl_symbol = _norm_symbol_to_hl(sig.symbol)
-    if not is_symbol_allowed(hl_symbol):
-        _log(f"[SKIP] Symbol '{hl_symbol}' not in HYPER_ONLY_EXECUTE_SYMBOLS (or allow list is empty).")
-        return
+        # Build ExecSignal with entry_band (parser already gives us tuple(low, high))
+        exec_sig = ExecSignal(
+            symbol=sig.symbol,
+            side=sig.side,
+            entry_band=sig.entry_band,
+            stop=sig.stop,
+            tps=sig.take_profits,
+            leverage=sig.leverage,
+            timeframe=sig.timeframe,
+        )
 
-    try:
-        ex = _signal_to_exec(sig)
-        _log(f"[EXEC] {ex.side.upper()} {ex.symbol} "
-             f"entry {ex.entry_low}–{ex.entry_high} SL {ex.stop} "
-             f"TPs {ex.tps} lev={ex.leverage or 'default'} tf={ex.timeframe or ''}")
-        ok, resp = execute_signal(ex)
-        if ok:
-            await message.add_reaction("✅")
-            _log(f"[OK] order placed: {resp}")
-        else:
-            await message.add_reaction("⚠️")
-            _log(f"[ERR] order rejected: {resp}")
-    except Exception as e:
-        _log(f"[EXC] execution error: {e}")
+        print(f"[PASS] from '{author}' in channel: {content.splitlines()[0][:64]}...")
         try:
-            await message.add_reaction("❌")
-        except Exception:
-            pass
+            await execute_signal(exec_sig)
+            print(f"[EXEC] submitted {sig.side} {sig.symbol} {sig.entry_band} SL={sig.stop}")
+        except Exception as e:
+            print(f"[EXC] execution error: {e}")
+
+    except Exception as e:
+        print(f"[ERR] on_message crash: {e}")
+
+
+# ---------- Entrypoint ----------
 
 def start():
-    client.run(DISCORD_TOKEN)
+    client.run(TOKEN)
+
+
+if __name__ == "__main__":
+    start()
