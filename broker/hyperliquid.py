@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import logging
 from typing import Dict, Optional, List, Any, Tuple
@@ -29,30 +30,15 @@ ENTRY_TIMEOUT_MIN = int(os.getenv("ENTRY_TIMEOUT_MIN", "120"))
 POLL_OPEN_ORDERS_SEC = int(os.getenv("POLL_OPEN_ORDERS_SEC", "20"))
 VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip()
 
-# --- SDK (optional but recommended) ------------------------------------------
+# --- SDK (for signing/placing only) -----------------------------------------
 SDK_AVAILABLE = True
 try:
-    from hyperliquid.info import Info
     from hyperliquid.exchange import Exchange
-    try:
-        from hyperliquid.utils import constants as HL_CONST  # not required
-    except Exception:
-        HL_CONST = None
 except Exception as e:
     SDK_AVAILABLE = False
-    LOG.warning("Hyperliquid SDK not available: %s", e)
+    LOG.warning("Hyperliquid SDK not available (placing will fail if DRY_RUN=false): %s", e)
 
-_SDK_INFO: Optional["Info"] = None
 _SDK_EX: Optional["Exchange"] = None
-
-
-def _sdk_info() -> "Info":
-    if not SDK_AVAILABLE:
-        raise RuntimeError("Hyperliquid SDK not installed. Install `hyperliquid-python-sdk`.")
-    global _SDK_INFO
-    if _SDK_INFO is None:
-        _SDK_INFO = Info(base_url=BASE_URL)
-    return _SDK_INFO
 
 
 def _sdk_exchange() -> "Exchange":
@@ -70,7 +56,7 @@ def _sdk_exchange() -> "Exchange":
         )
     return _SDK_EX
 
-# --- Meta cache --------------------------------------------------------------
+# --- Meta cache (via /info meta) --------------------------------------------
 
 
 class MetaCache:
@@ -81,40 +67,45 @@ class MetaCache:
         self._last_refresh = 0
 
     def ensure(self):
-        if not SDK_AVAILABLE:
-            return
         now = time.time()
         if self._meta is None or now - self._last_refresh > 300:
-            info = _sdk_info()
-            self._meta = info.meta()
+            self._meta = _http_info({"type": "meta"}).get("data", {})
             self._last_refresh = now
-            universe = self._meta.get("universe", [])
+            universe = self._meta.get("universe", []) or []
             self._asset_index.clear()
             self._sz_decimals.clear()
             for idx, entry in enumerate(universe):
                 coin = (entry.get("name") or entry.get("spotName") or "").upper()
                 if coin:
                     self._asset_index[coin] = idx
-                    self._sz_decimals[coin] = int(entry.get("szDecimals", 0))
+                    try:
+                        self._sz_decimals[coin] = int(entry.get("szDecimals", 0))
+                    except Exception:
+                        self._sz_decimals[coin] = 3
 
     def asset_index(self, coin: str) -> int:
         coin = coin.upper()
-        if SDK_AVAILABLE:
-            self.ensure()
-            if coin in self._asset_index:
-                return self._asset_index[coin]
-        raise RuntimeError(f"Asset index for {coin} not found. Ensure SDK/meta available.")
+        self.ensure()
+        if coin in self._asset_index:
+            return self._asset_index[coin]
+        raise RuntimeError(f"Asset index for {coin} not found. Check meta.")
 
     def sz_decimals(self, coin: str) -> int:
         coin = coin.upper()
-        if SDK_AVAILABLE:
-            self.ensure()
-            if coin in self._sz_decimals:
-                return self._sz_decimals[coin]
-        return 3
+        self.ensure()
+        return self._sz_decimals.get(coin, 3)
 
 
 META = MetaCache()
+
+# --- HTTP helpers ------------------------------------------------------------
+
+
+def _http_info(payload: Dict, timeout: int = 5) -> Dict:
+    r = requests.post(f"{BASE_URL}/info", json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json() or {}
+
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -126,40 +117,30 @@ def _symbol_to_coin(symbol: str) -> str:
 
 def _get_mark_price(coin: str) -> float:
     coin = coin.upper()
-    if SDK_AVAILABLE:
-        info = _sdk_info()
-        try:
-            d = info.active_asset_ctx(coin)
-            ctx = d.get("ctx", {})
-            mark = float(ctx.get("markPx"))
-            if mark > 0:
-                return mark
-        except Exception as e:
-            LOG.warning("active_asset_ctx failed for %s: %s", coin, e)
-        try:
-            mids = info.all_mids()
-            mid = float(mids.get("mids", {}).get(coin))
-            if mid > 0:
-                return mid
-        except Exception as e:
-            LOG.warning("all_mids failed for %s: %s", coin, e)
-    # Fallback: HTTP l2Book midpoint
+    # Try allMids first
     try:
-        r = requests.post(
-            f"{BASE_URL}/info",
-            json={"type": "l2Book", "coin": coin, "nSigFigs": 5, "mantissa": None},
-            timeout=5,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        levels = data.get("levels", [[], []])
-        bids, asks = levels[0], levels[1]
-        if bids and asks:
-            best_bid = float(bids[0]["px"])
-            best_ask = float(asks[0]["px"])
-            return (best_bid + best_ask) / 2.0
+        resp = _http_info({"type": "allMids"})
+        # Some deployments wrap under {"data":{"mids":{...}}}, others expose {"mids":{...}}
+        mids = resp.get("data", {}).get("mids") or resp.get("mids")
+        if isinstance(mids, dict) and coin in mids and mids[coin] is not None:
+            return float(mids[coin])
     except Exception as e:
-        LOG.error("HTTP l2Book fallback failed for %s: %s", coin, e)
+        LOG.warning("allMids via HTTP failed for %s: %s", coin, e)
+
+    # Fallback: l2Book midpoint
+    try:
+        resp = _http_info({"type": "l2Book", "coin": coin, "nSigFigs": 5, "mantissa": None})
+        data = resp.get("data", {})
+        levels = data.get("levels", [[], []])
+        if isinstance(levels, list) and len(levels) == 2:
+            bids, asks = levels[0], levels[1]
+            if bids and asks:
+                best_bid = float(bids[0]["px"])
+                best_ask = float(asks[0]["px"])
+                return (best_bid + best_ask) / 2.0
+    except Exception as e:
+        LOG.warning("l2Book midpoint via HTTP failed for %s: %s", coin, e)
+
     raise RuntimeError("Could not compute size from mark price; aborting.")
 
 
@@ -203,55 +184,73 @@ def _maybe_tuple(v: Any) -> Optional[Tuple[float, float]]:
     return None
 
 
+def _extract_band_from_strings(sig: Any) -> Optional[Tuple[float, float]]:
+    """
+    Last-resort: parse band from string fields or repr.
+    Looks for 'band=(x, y)' pattern.
+    """
+    pattern = re.compile(r"band=\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)", re.IGNORECASE)
+
+    # 1) __str__/__repr__
+    try:
+        s = str(sig)
+        m = pattern.search(s)
+        if m:
+            return float(m.group(1)), float(m.group(2))
+    except Exception:
+        pass
+
+    # 2) Any str-like attribute/dict key that contains 'band'
+    try:
+        items = list(vars(sig).items()) if not isinstance(sig, dict) else list(sig.items())
+        for k, v in items:
+            if isinstance(k, str) and "band" in k.lower() and isinstance(v, str):
+                m = pattern.search(v)
+                if m:
+                    return float(m.group(1)), float(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
 def _extract_signal(sig: Any) -> Dict[str, Any]:
     side = (_read(sig, "side", "direction") or "").upper()
     symbol = _read(sig, "symbol", "ticker", "pair") or ""
 
-    # Try a broad set of alias names for band low/high:
+    # Broad alias sets for band
     low_aliases = (
         "band_low", "band_lo", "band_min",
         "entry_low", "entry_min",
         "low", "lo", "min", "lower",
         "entry_band_low", "entry_band_lo", "entry_band_min",
+        "min_price", "entry_lower", "range_low", "lower_band",
     )
     high_aliases = (
         "band_high", "band_hi", "band_max",
         "entry_high", "entry_max",
         "high", "hi", "max", "upper",
         "entry_band_high", "entry_band_hi", "entry_band_max",
+        "max_price", "entry_upper", "range_high", "upper_band",
     )
 
     band_low = _read(sig, *low_aliases)
     band_high = _read(sig, *high_aliases)
 
-    # If still missing, auto-detect any tuple/list band field.
+    # Tuple-style candidates
     if band_low is None or band_high is None:
-        # Common tuple field names:
-        tuple_names = ("band", "entry_band", "entry", "range", "price_band", "entry_range")
+        tuple_names = ("band", "entry_band", "entry", "range", "price_band", "entry_range", "band_bounds")
         for name in tuple_names:
             v = _read(sig, name)
             pair = _maybe_tuple(v)
             if pair:
                 band_low, band_high = pair
                 break
-        # If still none, scan any attribute/dict key that contains 'band' or 'entry'
-        if (band_low is None or band_high is None) and not isinstance(sig, dict):
-            try:
-                for k, v in vars(sig).items():
-                    if isinstance(k, str) and any(s in k.lower() for s in ("band", "entry")):
-                        pair = _maybe_tuple(v)
-                        if pair:
-                            band_low, band_high = pair
-                            break
-            except Exception:
-                pass
-        if (band_low is None or band_high is None) and isinstance(sig, dict):
-            for k, v in sig.items():
-                if isinstance(k, str) and any(s in k.lower() for s in ("band", "entry")):
-                    pair = _maybe_tuple(v)
-                    if pair:
-                        band_low, band_high = pair
-                        break
+
+    # String fallback
+    if band_low is None or band_high is None:
+        pair = _extract_band_from_strings(sig)
+        if pair:
+            band_low, band_high = pair
 
     stop_loss = _read(sig, "stop_loss", "sl", "stop", "stopPrice")
     tp_count = _read(sig, "tp_count", "tpn", "tpN", "take_profit_count", default=1)
@@ -345,7 +344,7 @@ def _build_order_plan(*, side: str, coin: str, band_low: float, band_high: float
     if FIXED_QTY:
         base_qty = float(FIXED_QTY)
     else:
-        notional = max(TRADE_SIZE_USD, 10.0)
+        notional = max(TRADE_SIZE_USD, 10.0)  # HL minimum notional is $10
         base_qty = notional / max(mark, 1e-9)
 
     size_str = quantize_size(coin, base_qty)
@@ -397,6 +396,7 @@ def _place_order_real(plan: Dict) -> None:
             LOG.warning("[HL] update_leverage failed on %s: %s", coin, e)
 
     orders = []
+    # entry
     orders.append({
         "a": asset,
         "b": is_buy,
@@ -405,7 +405,7 @@ def _place_order_real(plan: Dict) -> None:
         "r": False,
         "t": {"limit": {"tif": tif}},
     })
-
+    # tps
     for tp in tps:
         orders.append({
             "a": asset,
@@ -415,7 +415,7 @@ def _place_order_real(plan: Dict) -> None:
             "r": True,
             "t": {"trigger": {"isMarket": True, "triggerPx": tp["px"], "tpsl": "tp"}},
         })
-
+    # sl
     if sl:
         orders.append({
             "a": asset,
