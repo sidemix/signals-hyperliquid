@@ -56,8 +56,14 @@ def _sdk_exchange() -> "Exchange":
         )
     return _SDK_EX
 
-# --- Meta cache (via /info meta) --------------------------------------------
+# --- HTTP helpers ------------------------------------------------------------
 
+def _http_info(payload: Dict, timeout: int = 5) -> Dict:
+    r = requests.post(f"{BASE_URL}/info", json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json() or {}
+
+# --- Meta cache (via /info meta) --------------------------------------------
 
 class MetaCache:
     def __init__(self):
@@ -88,67 +94,95 @@ class MetaCache:
         self.ensure()
         if coin in self._asset_index:
             return self._asset_index[coin]
-        raise RuntimeError(f"Asset index for {coin} not found. Check meta.")
+        raise RuntimeError(f"Asset index for {coin} not found in meta; ensure correct symbol and network.")
 
     def sz_decimals(self, coin: str) -> int:
         coin = coin.upper()
         self.ensure()
         return self._sz_decimals.get(coin, 3)
 
-
 META = MetaCache()
 
-# --- HTTP helpers ------------------------------------------------------------
-
-
-def _http_info(payload: Dict, timeout: int = 5) -> Dict:
-    r = requests.post(f"{BASE_URL}/info", json=payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json() or {}
-
-
-# --- Helpers -----------------------------------------------------------------
-
+# --- Symbol helpers ----------------------------------------------------------
 
 def _symbol_to_coin(symbol: str) -> str:
     s = symbol.upper().strip()
     return s.split("/")[0] if "/" in s else s
 
+def _coin_aliases(coin: str) -> List[str]:
+    """Try multiple coin labels the API might accept."""
+    c = coin.upper()
+    base = c.split("/")[0]
+    alts = {c, base, base + "USD", base + "-USD"}  # ETH, ETHUSD, ETH-USD
+    return list(alts)
+
+# --- Price helpers -----------------------------------------------------------
+
+def _get_mark_price_http(coin: str) -> Optional[float]:
+    """Robust HTTP-only mark resolver. Try allMids, then l2Book, then recentTrades, then 1m candle close."""
+    for sym in _coin_aliases(coin):
+        # allMids
+        try:
+            resp = _http_info({"type": "allMids"})
+            mids = resp.get("data", {}).get("mids") or resp.get("mids")
+            if isinstance(mids, dict):
+                val = mids.get(sym)
+                if val is not None:
+                    return float(val)
+        except Exception as e:
+            LOG.debug("allMids failed for %s: %s", sym, e)
+
+        # l2Book midpoint
+        try:
+            resp = _http_info({"type": "l2Book", "coin": sym, "nSigFigs": 5, "mantissa": None})
+            data = resp.get("data", {})
+            levels = data.get("levels", [[], []])
+            if isinstance(levels, list) and len(levels) == 2 and levels[0] and levels[1]:
+                best_bid = float(levels[0][0]["px"])
+                best_ask = float(levels[1][0]["px"])
+                return (best_bid + best_ask) / 2.0
+        except Exception as e:
+            LOG.debug("l2Book failed for %s: %s", sym, e)
+
+        # recentTrades last price
+        try:
+            resp = _http_info({"type": "recentTrades", "coin": sym, "n": 1})
+            trades = resp.get("data") or resp.get("trades") or []
+            if isinstance(trades, list) and trades:
+                px = trades[0].get("px")
+                if px is not None:
+                    return float(px)
+        except Exception as e:
+            LOG.debug("recentTrades failed for %s: %s", sym, e)
+
+        # candleSnapshot close
+        try:
+            resp = _http_info({"type": "candleSnapshot", "interval": "1m", "coin": sym, "n": 1})
+            # Response shapes vary; accept both {"data":{"candles":[...]}} and {"candles":[...]}
+            candles = (resp.get("data") or {}).get("candles") or resp.get("candles") or []
+            if isinstance(candles, list) and candles:
+                # candle fields sometimes objects, sometimes arrays; handle both
+                c0 = candles[-1]
+                close = c0.get("c") if isinstance(c0, dict) else (c0[4] if isinstance(c0, (list, tuple)) and len(c0) >= 5 else None)
+                if close is not None:
+                    return float(close)
+        except Exception as e:
+            LOG.debug("candleSnapshot failed for %s: %s", sym, e)
+
+    return None
 
 def _get_mark_price(coin: str) -> float:
-    coin = coin.upper()
-    # Try allMids first
-    try:
-        resp = _http_info({"type": "allMids"})
-        # Some deployments wrap under {"data":{"mids":{...}}}, others expose {"mids":{...}}
-        mids = resp.get("data", {}).get("mids") or resp.get("mids")
-        if isinstance(mids, dict) and coin in mids and mids[coin] is not None:
-            return float(mids[coin])
-    except Exception as e:
-        LOG.warning("allMids via HTTP failed for %s: %s", coin, e)
+    mark = _get_mark_price_http(coin)
+    if mark is None:
+        raise RuntimeError("Could not compute size from mark price; aborting.")
+    return mark
 
-    # Fallback: l2Book midpoint
-    try:
-        resp = _http_info({"type": "l2Book", "coin": coin, "nSigFigs": 5, "mantissa": None})
-        data = resp.get("data", {})
-        levels = data.get("levels", [[], []])
-        if isinstance(levels, list) and len(levels) == 2:
-            bids, asks = levels[0], levels[1]
-            if bids and asks:
-                best_bid = float(bids[0]["px"])
-                best_ask = float(asks[0]["px"])
-                return (best_bid + best_ask) / 2.0
-    except Exception as e:
-        LOG.warning("l2Book midpoint via HTTP failed for %s: %s", coin, e)
-
-    raise RuntimeError("Could not compute size from mark price; aborting.")
-
+# --- Quantization ------------------------------------------------------------
 
 def quantize_size(coin: str, sz: float) -> str:
     sd = META.sz_decimals(coin)
     q = round(sz, sd)
     return f"{q:.{sd}f}"
-
 
 def quantize_price(coin: str, px: float, is_perp: bool = True) -> str:
     sd = META.sz_decimals(coin)
@@ -164,6 +198,7 @@ def quantize_price(coin: str, px: float, is_perp: bool = True) -> str:
             out = f"{q:.{cut}f}"
     return out
 
+# --- Signal extraction -------------------------------------------------------
 
 def _read(sig: Any, *names, default=None):
     for n in names:
@@ -172,7 +207,6 @@ def _read(sig: Any, *names, default=None):
         if isinstance(sig, dict) and n in sig:
             return sig[n]
     return default
-
 
 def _maybe_tuple(v: Any) -> Optional[Tuple[float, float]]:
     try:
@@ -183,15 +217,8 @@ def _maybe_tuple(v: Any) -> Optional[Tuple[float, float]]:
         pass
     return None
 
-
 def _extract_band_from_strings(sig: Any) -> Optional[Tuple[float, float]]:
-    """
-    Last-resort: parse band from string fields or repr.
-    Looks for 'band=(x, y)' pattern.
-    """
     pattern = re.compile(r"band=\(\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*\)", re.IGNORECASE)
-
-    # 1) __str__/__repr__
     try:
         s = str(sig)
         m = pattern.search(s)
@@ -199,8 +226,6 @@ def _extract_band_from_strings(sig: Any) -> Optional[Tuple[float, float]]:
             return float(m.group(1)), float(m.group(2))
     except Exception:
         pass
-
-    # 2) Any str-like attribute/dict key that contains 'band'
     try:
         items = list(vars(sig).items()) if not isinstance(sig, dict) else list(sig.items())
         for k, v in items:
@@ -212,33 +237,26 @@ def _extract_band_from_strings(sig: Any) -> Optional[Tuple[float, float]]:
         pass
     return None
 
-
 def _extract_signal(sig: Any) -> Dict[str, Any]:
     side = (_read(sig, "side", "direction") or "").upper()
     symbol = _read(sig, "symbol", "ticker", "pair") or ""
 
-    # Broad alias sets for band
     low_aliases = (
-        "band_low", "band_lo", "band_min",
-        "entry_low", "entry_min",
-        "low", "lo", "min", "lower",
-        "entry_band_low", "entry_band_lo", "entry_band_min",
-        "min_price", "entry_lower", "range_low", "lower_band",
+        "band_low","band_lo","band_min","entry_low","entry_min",
+        "low","lo","min","lower","entry_band_low","entry_band_lo","entry_band_min",
+        "min_price","entry_lower","range_low","lower_band",
     )
     high_aliases = (
-        "band_high", "band_hi", "band_max",
-        "entry_high", "entry_max",
-        "high", "hi", "max", "upper",
-        "entry_band_high", "entry_band_hi", "entry_band_max",
-        "max_price", "entry_upper", "range_high", "upper_band",
+        "band_high","band_hi","band_max","entry_high","entry_max",
+        "high","hi","max","upper","entry_band_high","entry_band_hi","entry_band_max",
+        "max_price","entry_upper","range_high","upper_band",
     )
 
     band_low = _read(sig, *low_aliases)
     band_high = _read(sig, *high_aliases)
 
-    # Tuple-style candidates
     if band_low is None or band_high is None:
-        tuple_names = ("band", "entry_band", "entry", "range", "price_band", "entry_range", "band_bounds")
+        tuple_names = ("band","entry_band","entry","range","price_band","entry_range","band_bounds")
         for name in tuple_names:
             v = _read(sig, name)
             pair = _maybe_tuple(v)
@@ -246,7 +264,6 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
                 band_low, band_high = pair
                 break
 
-    # String fallback
     if band_low is None or band_high is None:
         pair = _extract_band_from_strings(sig)
         if pair:
@@ -259,11 +276,8 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
 
     if not side or not symbol:
         raise ValueError(f"Signal missing side/symbol: {sig}")
-
     if band_low is None or band_high is None:
-        tried = ", ".join(low_aliases) + " / " + ", ".join(high_aliases)
-        raise ValueError(f"Signal missing band_low/band_high. Tried aliases: {tried}")
-
+        raise ValueError("Signal missing band_low/band_high (or equivalent fields).")
     if stop_loss is None:
         raise ValueError("Signal missing stop_loss/SL.")
 
@@ -271,7 +285,6 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
         tp_count = int(tp_count)
     except Exception:
         tp_count = 1
-
     try:
         leverage = int(leverage) if leverage is not None else None
     except Exception:
@@ -289,7 +302,6 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
     )
 
 # --- Public API --------------------------------------------------------------
-
 
 def submit_signal(sig: Any) -> None:
     s = _extract_signal(sig)
@@ -334,12 +346,15 @@ def submit_signal(sig: Any) -> None:
     }
     _place_order_real(payload)
 
-
 def _build_order_plan(*, side: str, coin: str, band_low: float, band_high: float, stop_loss: float, tp_count: int):
     side_up = side.upper()
     px_entry = band_low if side_up == "SHORT" else band_high
 
-    mark = _get_mark_price(coin)
+    # Mark for sizing; if it fails, gracefully fallback to entry price
+    mark = _get_mark_price_http(coin)
+    if mark is None:
+        LOG.warning("[PRICE] mark fetch failed for %s; falling back to entry price for sizing", coin)
+        mark = float(px_entry)
 
     if FIXED_QTY:
         base_qty = float(FIXED_QTY)
@@ -366,7 +381,6 @@ def _build_order_plan(*, side: str, coin: str, band_low: float, band_high: float
 
     sl_px_str = quantize_price(coin, float(stop_loss), is_perp=True)
     return size_str, px_entry_str, {"tps": tps, "sl": {"px": sl_px_str}}
-
 
 def _place_order_real(plan: Dict) -> None:
     coin = plan["coin"]
