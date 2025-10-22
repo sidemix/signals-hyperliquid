@@ -324,47 +324,55 @@ def _build_order_plan(
 # Real placement (SDK) — guarded by DRY_RUN and config validation
 # ---------------------------------------------------------------------------------
 def _place_order_real(
+    *,
+    side: str,
     coin: str,
-    asset_idx: int,
-    is_buy: bool,
-    px_str: str,
-    sz_str: str,
-    reduce_only: bool = False,
-) -> Dict[str, Any]:
+    asset: int,
+    px: str,
+    sz: str,
+    tif: str,
+    reduce_only: bool,
+) -> dict:
     """
-    Place a single LIMIT order using the SDK's Exchange client.
-    NOTE:
-      - You MUST provide AGENT_PRIVATE_KEY in env for signing.
+    Place a real order via the HL SDK.
+    Supports both SDK call shapes:
+      - NEWER: ex.order(action, nonce=..., vaultAddress=...)
+      - LEGACY (0.20.x): ex.order({"action": action, "nonce": ..., "vaultAddress": ...})
     """
-    if DRY_RUN:
-        raise RuntimeError("DRY_RUN is enabled; refusing to place a real order.")
+    nonce = int(time.time() * 1000)
 
-    ex = _get_exchange()
-
-    # Build order payload (limit)
-    order = {
-        "a": asset_idx,            # asset index
-        "b": bool(is_buy),         # isBuy
-        "p": str(px_str),          # price
-        "s": str(sz_str),          # size
-        "r": bool(reduce_only),    # reduceOnly
-        "t": {"limit": {"tif": TIF}},
-    }
-
+    # Build the "action" object (SDK expects this exact shape)
     action = {
         "type": "order",
-        "orders": [order],
+        "orders": [{
+            "a": asset,                       # asset index
+            "b": (side.upper() == "BUY"),     # isBuy
+            "p": px,                          # price (string)
+            "s": sz,                          # size  (string)
+            "r": reduce_only,                 # reduceOnly
+            "t": {"limit": {"tif": tif}},     # time-in-force
+        }],
         "grouping": "na",
     }
 
-    nonce = int(time.time() * 1000)
-
+    # Try the new signature first; fall back to legacy payload if needed.
     try:
-        # Exchange client typically handles signing internally
-        resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[attr-defined]
-        return {"status": "ok", "response": resp}
-    except Exception as e:
-        raise RuntimeError(f"SDK order failed: {e}") from e
+        resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
+    except TypeError:
+        # Older SDK (0.20.x) expects a single dict payload
+        payload = {"action": action, "nonce": nonce}
+        if VAULT_ADDRESS:
+            payload["vaultAddress"] = VAULT_ADDRESS
+        resp = ex.order(payload)
+
+    # Optional: sanity log
+    log.info(f"[BROKER] order response: {resp}")
+
+    # Basic error check like before (keep your existing validator if you have one)
+    if not isinstance(resp, dict) or resp.get("status") != "ok":
+        raise RuntimeError(f"Order rejected by API: {resp}")
+    return resp
+
 
 
 # ---------------------------------------------------------------------------------
