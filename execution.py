@@ -22,8 +22,8 @@ class ExecSignal:
     """
     Flexible container for parsed trade signals.
 
-    We include multiple alias fields to match your parser’s output without
-    forcing refactors elsewhere (e.g., band vs. band_low/band_high, sl vs stop_loss).
+    Includes many alias fields so upstream parsers can pass different names
+    (e.g., entry_band, range, price_band, etc.) without breaking imports.
     """
     # Discord/message metadata
     msg_id: Optional[int] = None
@@ -31,23 +31,54 @@ class ExecSignal:
     id: Optional[int] = None
 
     # Core signal
-    side: str = ""           # "LONG" | "SHORT"
-    symbol: str = ""         # "ETH/USD", "BTC/USD", etc.
+    side: str = ""            # "LONG" | "SHORT"
+    symbol: str = ""          # "ETH/USD", "BTC/USD", etc.
+    direction: Optional[str] = None
+    ticker: Optional[str] = None
+    pair: Optional[str] = None
 
-    # Entry band (any of these may be present)
+    # Entry band variants
     band: Optional[Tuple[float, float]] = None
+    entry_band: Optional[Tuple[float, float]] = None
+    entry: Optional[Tuple[float, float]] = None
+    range: Optional[Tuple[float, float]] = None
+    price_band: Optional[Tuple[float, float]] = None
+    band_bounds: Optional[Tuple[float, float]] = None
+
+    # Separate low/high aliases (some parsers pass scalar fields)
     band_low: Optional[float] = None
     band_high: Optional[float] = None
+    entry_low: Optional[float] = None
+    entry_high: Optional[float] = None
+    range_low: Optional[float] = None
+    range_high: Optional[float] = None
+    lower_band: Optional[float] = None
+    upper_band: Optional[float] = None
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    low: Optional[float] = None
+    high: Optional[float] = None
+    lo: Optional[float] = None
+    hi: Optional[float] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
 
-    # Risk & targets
+    # Risk & targets (aliases)
     stop_loss: Optional[float] = None
     sl: Optional[float] = None
+    stop: Optional[float] = None
+    stopPrice: Optional[float] = None
+
     tp_count: Optional[int] = None
     tpn: Optional[int] = None
+    tpN: Optional[int] = None
+    take_profit_count: Optional[int] = None
 
-    # Leverage & timeframe (aliases supported)
+    # Leverage & timeframe (aliases)
     leverage: Optional[int] = None
     lev: Optional[int] = None
+    x: Optional[int] = None
+
     timeframe: str = ""
     tf: Optional[str] = None
 
@@ -55,27 +86,45 @@ class ExecSignal:
     raw: Any = None
 
     def __repr__(self) -> str:
-        # Nice, compact summary that matches your log style
-        # Prefer band tuple if present; else synthesize from lows/highs
-        band_txt = None
-        if self.band is not None:
-            try:
-                band_txt = f"({float(self.band[0]):.2f}, {float(self.band[1]):.2f})"
-            except Exception:
-                band_txt = str(self.band)
-        elif self.band_low is not None and self.band_high is not None:
-            band_txt = f"({float(self.band_low):.2f}, {float(self.band_high):.2f})"
+        # Prefer the most canonical band visible
+        band_tuple = (
+            self.band or self.entry_band or self.entry or self.range
+            or self.price_band or self.band_bounds
+        )
 
-        sl_val = self.stop_loss if self.stop_loss is not None else self.sl
-        tpn_val = self.tp_count if self.tp_count is not None else self.tpn
-        lev_val = self.leverage if self.leverage is not None else self.lev
+        # If only scalar lows/highs exist, synthesize a band
+        if band_tuple is None:
+            low = (self.band_low or self.entry_low or self.range_low
+                   or self.lower_band or self.min_price or self.low or self.lo or self.min)
+            high = (self.band_high or self.entry_high or self.range_high
+                    or self.upper_band or self.max_price or self.high or self.hi or self.max)
+            if low is not None and high is not None:
+                band_tuple = (float(low), float(high))
+
+        band_txt = None
+        if band_tuple is not None:
+            try:
+                band_txt = f"({float(band_tuple[0]):.2f}, {float(band_tuple[1]):.2f})"
+            except Exception:
+                band_txt = str(band_tuple)
+
+        sl_val = (
+            self.stop_loss if self.stop_loss is not None else
+            (self.sl if self.sl is not None else (self.stop if self.stop is not None else self.stopPrice))
+        )
+        tpn_val = self.tp_count if self.tp_count is not None else (self.tpn if self.tpn is not None else self.tpN if self.tpN is not None else self.take_profit_count)
+        lev_val = self.leverage if self.leverage is not None else (self.lev if self.lev is not None else self.x)
         tf_val = self.timeframe or (self.tf or "")
 
+        # Canonical side/symbol
+        side = (self.side or self.direction or "")
+        symbol = self.symbol or self.ticker or self.pair or ""
+
         parts = []
-        if self.side:
-            parts.append(self.side.upper())
-        if self.symbol:
-            parts.append(self.symbol)
+        if side:
+            parts.append(side.upper())
+        if symbol:
+            parts.append(symbol)
         head = " ".join(parts) if parts else "signal"
 
         extras = []
@@ -111,9 +160,10 @@ def _get_msg_id(sig: Any) -> Optional[int]:
         if hasattr(sig, name):
             try:
                 val = getattr(sig, name)
-                if isinstance(val, (int,)) or (isinstance(val, str) and val.isdigit()):
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str) and val.isdigit():
                     return int(val)
-                return val
             except Exception:
                 pass
     # Dict style
@@ -122,9 +172,10 @@ def _get_msg_id(sig: Any) -> Optional[int]:
             if name in sig:
                 try:
                     val = sig[name]
-                    if isinstance(val, (int,)) or (isinstance(val, str) and val.isdigit()):
+                    if isinstance(val, int):
+                        return val
+                    if isinstance(val, str) and val.isdigit():
                         return int(val)
-                    return val
                 except Exception:
                     pass
     return None
@@ -183,7 +234,10 @@ def _summarize(sig: Any) -> str:
 
     side = (read("side", "direction", default="")).upper()
     symbol = read("symbol", "ticker", "pair", default="")
-    band = read("band") or read("entry_band") or read("entry") or read("range") or ""
+    band = (
+        read("band") or read("entry_band") or read("entry") or
+        read("range") or read("price_band") or read("band_bounds") or ""
+    )
     sl = read("stop_loss", "sl", "stop", "stopPrice", default=None)
     tpn = read("tp_count", "tpn", "tpN", "take_profit_count", default=None)
     lev = read("leverage", "lev", "x", default=None)
@@ -247,12 +301,12 @@ def execute_signal(sig: Any) -> None:
 # Local smoke test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Minimal manual test
+    # Minimal manual test with entry_band alias
     s = ExecSignal(
         msg_id=123,
         side="SHORT",
         symbol="ETH/USD",
-        band=(3875.33, 3877.16),
+        entry_band=(3875.33, 3877.16),
         sl=3899.68,
         tpn=6,
         lev=20,
