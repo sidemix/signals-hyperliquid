@@ -6,7 +6,7 @@ import logging
 import traceback
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, List
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -23,7 +23,7 @@ class ExecSignal:
     Flexible container for parsed trade signals.
 
     Includes many alias fields so upstream parsers can pass different names
-    (e.g., entry_band, range, price_band, etc.) without breaking imports.
+    (e.g., entry_band, range, price_band, tps, etc.) without breaking imports.
     """
     # Discord/message metadata
     msg_id: Optional[int] = None
@@ -37,7 +37,7 @@ class ExecSignal:
     ticker: Optional[str] = None
     pair: Optional[str] = None
 
-    # Entry band variants
+    # Entry band variants (tuple style)
     band: Optional[Tuple[float, float]] = None
     entry_band: Optional[Tuple[float, float]] = None
     entry: Optional[Tuple[float, float]] = None
@@ -45,7 +45,7 @@ class ExecSignal:
     price_band: Optional[Tuple[float, float]] = None
     band_bounds: Optional[Tuple[float, float]] = None
 
-    # Separate low/high aliases (some parsers pass scalar fields)
+    # Separate low/high aliases (scalar style)
     band_low: Optional[float] = None
     band_high: Optional[float] = None
     entry_low: Optional[float] = None
@@ -73,6 +73,12 @@ class ExecSignal:
     tpn: Optional[int] = None
     tpN: Optional[int] = None
     take_profit_count: Optional[int] = None
+
+    # Some parsers pass explicit TP lists — accept but we don't require them
+    tps: Optional[List[Any]] = None            # e.g., list of prices/levels/objects
+    targets: Optional[List[Any]] = None
+    take_profits: Optional[List[Any]] = None
+    tp_prices: Optional[List[float]] = None
 
     # Leverage & timeframe (aliases)
     leverage: Optional[int] = None
@@ -112,7 +118,10 @@ class ExecSignal:
             self.stop_loss if self.stop_loss is not None else
             (self.sl if self.sl is not None else (self.stop if self.stop is not None else self.stopPrice))
         )
-        tpn_val = self.tp_count if self.tp_count is not None else (self.tpn if self.tpn is not None else self.tpN if self.tpN is not None else self.take_profit_count)
+        tpn_val = (
+            self.tp_count if self.tp_count is not None else
+            (self.tpn if self.tpn is not None else self.tpN if self.tpN is not None else self.take_profit_count)
+        )
         lev_val = self.leverage if self.leverage is not None else (self.lev if self.lev is not None else self.x)
         tf_val = self.timeframe or (self.tf or "")
 
@@ -301,7 +310,7 @@ def execute_signal(sig: Any) -> None:
 # Local smoke test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Minimal manual test with entry_band alias
+    # Minimal manual test including tps alias
     s = ExecSignal(
         msg_id=123,
         side="SHORT",
@@ -309,6 +318,7 @@ if __name__ == "__main__":
         entry_band=(3875.33, 3877.16),
         sl=3899.68,
         tpn=6,
+        tps=[3870, 3865, 3860, 3855, 3850, 3845],
         lev=20,
         tf="5m",
     )
