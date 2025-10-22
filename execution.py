@@ -1,111 +1,130 @@
-# execution.py
 """
-Public execution API used by discord_listener.py.
-
-Exports:
-  - ExecSignal            (dataclass the listener constructs)
-  - is_symbol_allowed()   (env-based symbol allow-list)
-  - execute_signal()      (hands parsed signal to broker.hyperliquid.submit_signal)
-
-Design notes
-------------
-- We avoid any top-level import of the broker to prevent circular imports.
-- The broker import happens *inside* execute_signal().
-- The broker already accepts either ExecSignal or kwargs; we pass the object through.
-
-Environment
------------
-HYPER_ONLY_EXECUTE_SYMBOLS   Comma-separated list like "BTC/USD,ETH/USD".  Empty -> allow all.
+execution.py
+Handles parsed trading signals and routes them to the broker adapter.
+Now includes runtime-safe broker loader for hyperliquid.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
 import os
-import logging
+import traceback
+import importlib
+from dataclasses import dataclass
+from typing import Any, List, Tuple, Optional, Union
 
 
-# ---------- Logging ----------
-logger = logging.getLogger("execution")
-if not logger.handlers:
-    # Basic, quiet formatter – Render usually prefixes timestamps anyway
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[EXEC] %(message)s"))
-    logger.addHandler(h)
-logger.setLevel(logging.INFO)
+# ============================================================
+# Dataclass for structured trade signal
+# ============================================================
 
-
-# ---------- Dataclass shared across the app ----------
 @dataclass
 class ExecSignal:
-    symbol: str                          # e.g., "ETH/USD"
-    side: str                            # "LONG" | "SHORT"
-    entry_band: Tuple[float, float]      # (low, high)
-    stop: float                          # absolute price
-    tps: List[float]                     # take-profit ladder prices
-    leverage: Optional[float] = None     # e.g., 20.0
-    timeframe: Optional[str] = None      # e.g., "5m"
+    symbol: str
+    side: str
+    entry_band: Tuple[float, float]
+    stop: float
+    tps: List[float]
+    leverage: Optional[float] = None
+    timeframe: Optional[str] = None
 
 
-# ---------- Helpers ----------
-def _normalize_symbol(s: str) -> str:
-    s = (s or "").strip().upper()
-    # Minimal normalization: ensure slash, USD quote when obvious
-    if "-" in s and "/USD" not in s and s.endswith("-USD"):
-        base = s[:-4]
-        return f"{base}/USD"
-    return s
+# ============================================================
+# Helper utilities
+# ============================================================
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Read boolean env var."""
+    return str(os.getenv(key, "1" if default else "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
-def is_symbol_allowed(symbol: str) -> bool:
+def _in_allow_list(symbol: str) -> bool:
     """
-    Returns True if the symbol is allowed by HYPER_ONLY_EXECUTE_SYMBOLS.
-    Empty/absent env means 'allow all'.
+    Check if a symbol is allowed to execute based on HYPER_ONLY_EXECUTE_SYMBOLS.
+    e.g., HYPER_ONLY_EXECUTE_SYMBOLS=BTC/USD,ETH/USD,SOL/USD
     """
-    raw = os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").strip()
-    if not raw:
+    allowed = os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "")
+    if not allowed:
         return True
-    allowed = {x.strip().upper() for x in raw.split(",") if x.strip()}
-    return _normalize_symbol(symbol) in allowed
+    syms = [s.strip().upper() for s in allowed.split(",") if s.strip()]
+    return symbol.upper() in syms
 
 
-# ---------- Public entry called by the listener ----------
+# ============================================================
+# Dynamic Broker Import (robust version)
+# ============================================================
+
+def _get_broker_submit():
+    """
+    Dynamically import the broker.hyperliquid.submit_signal callable.
+    Gives detailed error logs if import fails or symbol missing.
+    """
+    try:
+        mod = importlib.import_module("broker.hyperliquid")
+    except Exception:
+        tb = traceback.format_exc()
+        raise RuntimeError(f"Broker import failed:\n{tb}")
+
+    submit_fn = getattr(mod, "submit_signal", None)
+    if not callable(submit_fn):
+        attrs = ", ".join(a for a in dir(mod) if not a.startswith("_"))
+        raise RuntimeError(
+            f"broker.hyperliquid has no callable 'submit_signal'. Found attributes: {attrs}"
+        )
+
+    return submit_fn
+
+
+# ============================================================
+# Core execution logic
+# ============================================================
+
 def execute_signal(sig: ExecSignal) -> None:
     """
-    Main entry point used by discord_listener.py.
-
-    Validates the symbol against the allow-list and forwards the signal
-    to the broker's submit function. Any exceptions are allowed to bubble
-    so the caller can log them cleanly.
+    Executes a parsed signal by routing to the broker adapter.
     """
-    # Normalize / sanity
-    sig.symbol = _normalize_symbol(sig.symbol)
+    try:
+        # Check allowed list
+        if not _in_allow_list(sig.symbol):
+            print(f"[EXEC] {sig.symbol} not allowed by HYPER_ONLY_EXECUTE_SYMBOLS")
+            return
 
-    if not is_symbol_allowed(sig.symbol):
-        logger.info("%s not allowed by HYPER_ONLY_EXECUTE_SYMBOLS", sig.symbol)
-        return
+        # Log high-level signal info
+        print(
+            f"[EXEC] {sig.side.upper()} {sig.symbol.upper()} "
+            f"band=({sig.entry_band[0]:.6f}, {sig.entry_band[1]:.6f}) "
+            f"SL={sig.stop:.6f} TPn={len(sig.tps)} lev={sig.leverage or 'n/a'} TF={sig.timeframe or 'n/a'}"
+        )
 
-    logger.info(
-        "%s %s band=(%.6f, %.6f) SL=%.6f TPn=%d lev=%s TF=%s",
-        sig.side.upper(),
-        sig.symbol,
-        float(sig.entry_band[0]),
-        float(sig.entry_band[1]),
-        float(sig.stop),
-        len(sig.tps),
-        "n/a" if sig.leverage is None else f"{sig.leverage:.0f}",
-        sig.timeframe or "n/a",
+        # Dynamically load broker submit function
+        submit_fn = _get_broker_submit()
+
+        # Call broker with structured signal
+        submit_fn(sig)
+
+        print(
+            f"[EXEC] submitted {sig.side.upper()} {sig.symbol.upper()} "
+            f"({sig.entry_band[0]:.2f}, {sig.entry_band[1]:.2f}) SL={sig.stop:.2f}"
+        )
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[EXC] execution error: {e}\n{tb}")
+
+
+# ============================================================
+# Optional: Debug helper (for local testing)
+# ============================================================
+
+if __name__ == "__main__":
+    print("Testing execution.py with dummy signal...")
+
+    test_signal = ExecSignal(
+        symbol="ETH/USD",
+        side="SHORT",
+        entry_band=(3875.33, 3877.16),
+        stop=3899.68,
+        tps=[3863.16, 3853.43, 3843.69],
+        leverage=20,
+        timeframe="5m",
     )
 
-    # Lazy import to avoid circulars (broker imports execution for type hints)
-    try:
-        from broker.hyperliquid import submit_signal
-    except Exception as e:
-        raise RuntimeError(f"Broker import failed: {e}")
-
-    # Hand off to the broker; it accepts the ExecSignal object directly
-    submit_signal(sig)
-
-
-__all__ = ["ExecSignal", "is_symbol_allowed", "execute_signal"]
+    execute_signal(test_signal)
