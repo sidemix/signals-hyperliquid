@@ -323,12 +323,16 @@ def _build_order_plan(
 # ---------------------------------------------------------------------------------
 # Real placement (SDK) — guarded by DRY_RUN and config validation
 # ---------------------------------------------------------------------------------
+
 def _place_order_real(
     *,
-    side: str,
     coin: str,
-    asset_idx: int | None = None,   # <— accept asset_idx
-    asset: int | None = None,       # <— and asset (back-compat)
+    # accept either asset_idx or asset
+    asset_idx: int | None = None,
+    asset: int | None = None,
+    # accept either side (str) or is_buy (bool)
+    side: str | None = None,
+    is_buy: bool | None = None,
     px: str,
     sz: str,
     tif: str,
@@ -336,32 +340,41 @@ def _place_order_real(
 ) -> dict:
     """
     Place a real order via the HL SDK.
-    Accepts either `asset_idx` or `asset`.
-    Works with both newer and legacy SDK signatures.
+    - Accepts `asset_idx` or `asset`
+    - Accepts `side` ("BUY"/"SELL"/"LONG"/"SHORT") or `is_buy` (bool)
+    - Works with both newer and legacy SDK .order(..) signatures
     """
     a = asset_idx if asset_idx is not None else asset
     if a is None:
         raise ValueError("asset index is required")
+
+    # normalize buy flag
+    if is_buy is None:
+        if side is None:
+            raise ValueError("either `side` or `is_buy` must be provided")
+        side_u = side.upper()
+        is_buy = side_u in ("BUY", "LONG")
 
     nonce = int(time.time() * 1000)
 
     action = {
         "type": "order",
         "orders": [{
-            "a": a,                               # <-- asset index
-            "b": (side.upper() == "BUY"),
-            "p": px,
-            "s": sz,
-            "r": reduce_only,
+            "a": a,                 # asset index
+            "b": bool(is_buy),      # isBuy
+            "p": px,                # price (string)
+            "s": sz,                # size  (string)
+            "r": reduce_only,       # reduceOnly
             "t": {"limit": {"tif": tif}},
         }],
         "grouping": "na",
     }
 
-    # Try newer SDK signature first; fallback to legacy payload
     try:
+        # newer SDK
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
     except TypeError:
+        # legacy SDK (0.20.x)
         payload = {"action": action, "nonce": nonce}
         if VAULT_ADDRESS:
             payload["vaultAddress"] = VAULT_ADDRESS
@@ -371,7 +384,6 @@ def _place_order_real(
     if not isinstance(resp, dict) or resp.get("status") != "ok":
         raise RuntimeError(f"Order rejected by API: {resp}")
     return resp
-
 
 
 # ---------------------------------------------------------------------------------
