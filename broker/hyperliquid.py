@@ -267,6 +267,9 @@ def submit_signal(sig) -> Dict[str, Any]:
         log.info(f"[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: {sym}")
         return {"status": "skipped", "reason": "symbol not allowed", "symbol": sym}
 
+    log.info(f"[BROKER] symbol={sig.symbol} allowed={os.getenv('HYPER_ONLY_EXECUTE_SYMBOLS','*')}")
+
+
     # Resolve asset index for sanity/logging (not passed to order())
     try:
         a = _get_asset_index(coin)
