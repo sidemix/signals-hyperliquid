@@ -1,353 +1,113 @@
-"""
-broker/hyperliquid.py
-Routes ExecSignal objects to Hyperliquid via REST.
-- Computes size from TRADE_SIZE_USD and mark price
-- Builds an OTO bracket (entry + stop + TP ladder)
-- Honors DRY_RUN
-- Logs in a helpful, structured way
-
-REQUIRED ENVs
--------------
-HYPERLIQUID_BASE=https://api.hyperliquid.xyz
-TRADE_SIZE_USD=100
-DRY_RUN=true|false
-HYPER_ONLY_EXECUTE_SYMBOLS=BTC/USD,ETH/USD, ...      (optional allow-list)
-
-EVM signing (one of):
-- HYPER_EVM_PRIVKEY=0x...                             (preferred; use HyperEVM pk)
-or
-- HYPER_API_KEY / HYPER_API_SECRET                    (if you have a REST key flow)
-
-NOTE: The final _sign_and_post() stub needs your HL signer.
-"""
+# broker/hyperliquid.py
+# Drop-in broker for Hyperliquid perps using the official Python SDK.
+# - Places real orders (no stub)
+# - Handles asset discovery, precision, leverage, TP/SL grouping
+# - Respects DRY_RUN and environment sizing knobs
+#
+# Tyler: this file assumes your parser builds a "Signal" dict like the one logged in execution.py:
+#   {
+#     "side": "LONG" | "SHORT",
+#     "symbol": "ETH/USD",
+#     "band": (entry_min, entry_max),
+#     "sl": float,
+#     "tpn": int,           # number of take profits
+#     "lev": float,
+#     "tf": "5m"
+#   }
+# And execution.py calls: submit_signal(signal)
 
 from __future__ import annotations
 
-import os
-import time
 import json
 import math
-import typing as t
-import traceback
+import os
+import time
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
 
-import httpx
-
-# ---- optional import for type hints only ----
+# --- SDK imports
 try:
-    from execution import ExecSignal   # noqa
-except Exception:  # pragma: no cover
-    ExecSignal = t.Any  # type: ignore
-
-
-# =========================
-# Config helpers
-# =========================
-def _env(key: str, default: str = "") -> str:
-    return os.getenv(key, default).strip()
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    return str(os.getenv(key, "1" if default else "0")).lower() in ("1", "true", "yes", "on")
-
-
-HL_BASE = _env("HYPERLIQUID_BASE", "https://api.hyperliquid.xyz")
-HTTP_TIMEOUT = float(os.getenv("HL_HTTP_TIMEOUT", "10"))
-
-
-# =========================
-# Public entry point
-# =========================
-def submit_signal(sig_or_kwargs: t.Union["ExecSignal", dict], **kw) -> None:
-    """
-    Called by execution.execute_signal(). Accepts ExecSignal or a dict payload.
-    Normalizes into a dict and routes to placement.
-    """
-    payload = _normalize(sig_or_kwargs, **kw)
-    _log_preview(payload)
-
-    if _env_bool("DRY_RUN", False):
-        print("[BROKER] DRY_RUN=true — not sending to exchange.")
-        return
-
-    # minimal safety
-    if not (_env("HYPER_EVM_PRIVKEY") or (_env("HYPER_API_KEY") and _env("HYPER_API_SECRET"))):
-        raise RuntimeError("HYPER_EVM_PRIVKEY (or API key/secret) not set.")
-
-    # place real order
-    _place_order_real(payload)
-
-
-# =========================
-# Normalization / logging
-# =========================
-def _normalize(sig_or_kwargs: t.Union["ExecSignal", dict], **kw) -> dict:
-    if isinstance(sig_or_kwargs, dict):
-        d = {**sig_or_kwargs, **kw}
-        symbol = d["symbol"]
-        side = d["side"]
-        band = d.get("entry_band") or (d["entry_low"], d["entry_high"])
-        stop = float(d["stop"])
-        tps = [float(x) for x in d.get("tps", [])]
-        lev = d.get("leverage")
-        tf = d.get("timeframe")
-    else:
-        s = sig_or_kwargs
-        symbol, side = s.symbol, s.side
-        band = s.entry_band
-        stop = float(s.stop)
-        tps = list(s.tps)
-        lev = s.leverage
-        tf = s.timeframe
-
-    low, high = float(band[0]), float(band[1])
-    return {
-        "symbol": symbol.upper(),
-        "side": side.upper(),               # LONG|SHORT
-        "entry_band": (low, high),
-        "stop": stop,
-        "tps": tps,
-        "leverage": lev,
-        "timeframe": tf,
-    }
-
-
-def _log_preview(p: dict) -> None:
-    low, high = p["entry_band"]
-    print(
-        f"[BROKER] {p['side']} {p['symbol']} "
-        f"band=({low:.6f},{high:.6f}) SL={p['stop']:.6f} "
-        f"TPn={len(p['tps'])} lev={p.get('leverage') or 'n/a'} TF={p.get('timeframe') or 'n/a'}"
+    from hyperliquid.exchange import Exchange, OrderRequest, Tif, Trigger, TriggerType
+    from hyperliquid.info import Info, Env as HlEnv
+except Exception as e:
+    raise ImportError(
+        "hyperliquid-python-sdk is required. Add 'hyperliquid-python-sdk' to requirements.txt. "
+        f"Import error: {e}"
     )
 
-
-# =========================
-# Market / symbol helpers
-# =========================
-def _split_symbol(sym: str) -> t.Tuple[str, str]:
-    """
-    'ETH/USD' -> ('ETH', 'USD')
-    """
-    s = sym.replace("-", "/").upper()
-    parts = s.split("/")
-    if len(parts) != 2:
-        raise ValueError(f"Unsupported symbol: {sym}")
-    return parts[0], parts[1]
-
-
-def _get_mark_price(coin: str) -> float:
-    """
-    Query a mark/last price to compute order size.
-    Tries /info/ticker as primary; fallback to /info with body if needed.
-    """
-    url1 = f"{HL_BASE.rstrip('/')}/info/ticker"
-    url2 = f"{HL_BASE.rstrip('/')}/info"
-
-    # try simple ticker list first
-    try:
-        with httpx.Client(timeout=HTTP_TIMEOUT) as s:
-            r = s.get(url1)
-            r.raise_for_status()
-            data = r.json()
-            for it in data if isinstance(data, list) else []:
-                if (it.get("symbol") or it.get("instId") or "").upper().startswith(coin.upper()):
-                    px = it.get("markPrice") or it.get("lastPrice") or it.get("price")
-                    if px is not None:
-                        return float(px)
-    except Exception:
-        pass  # fall back
-
-    # flexible /info body
-    try:
-        body = {"type": "ticker", "coins": [coin]}
-        with httpx.Client(timeout=HTTP_TIMEOUT) as s:
-            r = s.post(url2, json=body)
-            r.raise_for_status()
-            data = r.json()
-            # try a couple of shapes
-            px = None
-            if isinstance(data, dict):
-                px = (
-                    data.get("markPx")
-                    or data.get("markPrice")
-                    or data.get("lastPx")
-                    or data.get("lastPrice")
-                )
-            if px is None and isinstance(data, list) and data:
-                cand = data[0]
-                px = cand.get("markPx") or cand.get("markPrice") or cand.get("lastPx") or cand.get("lastPrice")
-            if px is not None:
-                return float(px)
-    except Exception:
-        pass
-
-    raise RuntimeError("Could not compute size from mark price; aborting.")
-
-
-def _compute_size_usd_to_contracts(trade_usd: float, mark_px: float, min_qty: float = 0.0001) -> float:
-    raw = trade_usd / max(mark_px, 1e-9)
-    # round down to reasonable precision to avoid rejections
-    prec = 6
-    qty = math.floor(raw * (10 ** prec)) / (10 ** prec)
-    return max(qty, min_qty)
+# --- Logging
+import logging
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
 
 
 # =========================
-# OTO / order construction
+# Environment
 # =========================
-def _place_order_real(p: dict) -> None:
+
+ENV_HYPER_BASE       = os.getenv("HYPERLIQUID_BASE", "https://api.hyperliquid.xyz").rstrip("/")
+ENV_NETWORK          = os.getenv("HYPER_NETWORK", "mainnet").lower()  # 'mainnet' | 'testnet'
+ENV_DRY_RUN          = os.getenv("DRY_RUN", "false").lower() == "true"
+
+ENV_FIXED_QTY        = float(os.getenv("HYPER_FIXED_QTY", "0"))       # if >0, use coin units
+ENV_TRADE_SIZE_USD   = float(os.getenv("TRADE_SIZE_USD", "0"))        # else size by notional
+ENV_TP_WEIGHTS       = os.getenv("TP_WEIGHTS", "0.10,0.15,0.15,0.20,0.20,0.20")
+ENV_ONLY_EXECUTE     = os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "")    # "ETH/USD,BTC/USD,..."
+ENV_ACCOUNT_MODE     = os.getenv("ACCOUNT_MODE", "perp").lower()      # perp | spot
+ENV_EXECUTION_MODE   = os.getenv("XECUTION_MODE", "OTO").upper()      # OTO, LIMIT_ONLY, IOC_ONLY
+ENV_ENTRY_TIMEOUT_MIN= int(os.getenv("ENTRY_TIMEOUT_MIN", "120"))
+
+# Keys
+ENV_EVM_PRIVKEY      = os.getenv("HYPER_EVM_PRIVKEY", "")             # 0x...
+ENV_CHAIN_ID         = int(os.getenv("HYPER_EVM_CHAIN_ID", "999"))    # 999 mainnet, 998 testnet
+ENV_EVM_RPC          = os.getenv("HYPER_EVM_RPC", "https://rpc.hyperliquid.xyz/evm")
+
+if not ENV_EVM_PRIVKEY and not ENV_DRY_RUN:
+    raise RuntimeError("HYPER_EVM_PRIVKEY is required for live trading. Set DRY_RUN=true to simulate.")
+
+
+# =========================
+# Helpers / dataclasses
+# =========================
+
+@dataclass
+class AssetMeta:
+    index: int
+    sz_decimals: int
+
+
+class HyperliquidBroker:
     """
-    Build and submit the entry + stop + take profits.
-    This function is fully wired except the final signature step
-    in _sign_and_post(), which you must complete per HL docs or SDK.
+    Thin wrapper around Hyperliquid SDK: asset discovery, mark fetch, precision, placement.
     """
-    coin, quote = _split_symbol(p["symbol"])  # ('ETH','USD')
-    side = p["side"]                          # LONG | SHORT
-    entry_low, entry_high = p["entry_band"]
-    stop_px = float(p["stop"])
-    tp_list = [float(x) for x in p["tps"]]
 
-    # 1) get mark px and compute size
-    trade_usd = float(os.getenv("TRADE_SIZE_USD", "100"))
-    mark = _get_mark_price(coin)
-    size = _compute_size_usd_to_contracts(trade_usd, mark)
-
-    # 2) choose entry px (mid of band)
-    entry_px = (entry_low + entry_high) / 2.0
-
-    is_buy = True if side == "LONG" else False
-    reduce_only = False
-
-    # 3) place entry limit
-    entry_payload = _build_limit_order(
-        coin=coin,
-        is_buy=is_buy,
-        size=size,
-        px=entry_px,
-        tif="Gtc",              # Good till cancel
-        reduce_only=reduce_only
-    )
-
-    _sign_and_post(entry_payload)  # <— implement signing in this helper
-
-    # 4) place stop-loss (reduce only)
-    stop_reduce_only = True
-    stop_trigger = _build_trigger_order(
-        coin=coin,
-        is_buy=not is_buy,           # closes the position
-        size=size,
-        trigger_px=stop_px,
-        kind="stop",                 # or "stopMarket" if HL requires
-        reduce_only=stop_reduce_only
-    )
-    _sign_and_post(stop_trigger)
-
-    # 5) place TP ladder (reduce-only)
-    for tp_px in tp_list:
-        tp_reduce_only = True
-        tp_trigger = _build_trigger_order(
-            coin=coin,
-            is_buy=not is_buy,
-            size=round(size / max(len(tp_list), 1), 6),   # split evenly
-            trigger_px=tp_px,
-            kind="takeProfit",          # or "takeProfitMarket" depending on HL
-            reduce_only=tp_reduce_only
+    def __init__(self):
+        self._env = HlEnv.Mainnet if ENV_NETWORK == "mainnet" else HlEnv.Testnet
+        self._base = ENV_HYPER_BASE
+        self._info = Info(self._env, base_url=self._base)
+        self._exch = Exchange(
+            private_key=ENV_EVM_PRIVKEY if ENV_EVM_PRIVKEY else None,
+            env=self._env,
+            base_url=self._base,
+            evm_rpc_url=ENV_EVM_RPC,
+            chain_id=ENV_CHAIN_ID,
         )
-        _sign_and_post(tp_trigger)
+        self._asset_meta_cache: Dict[str, AssetMeta] = {}
+        self._tp_weights: List[float] = self._parse_tp_weights(ENV_TP_WEIGHTS)
+        self._allowed: Optional[set] = (
+            set([s.strip().upper() for s in ENV_ONLY_EXECUTE.split(",") if s.strip()])
+            if ENV_ONLY_EXECUTE else None
+        )
+        log.info(f"[HL] env={self._env.name} base={self._base} dry_run={ENV_DRY_RUN} exec_mode={ENV_EXECUTION_MODE}")
+        self._warm_meta()
 
+    # ---------- public ----------
 
-# -------- payload builders (keep these boring & explicit) --------
-def _build_limit_order(
-    *,
-    coin: str,
-    is_buy: bool,
-    size: float,
-    px: float,
-    tif: str = "Gtc",
-    reduce_only: bool = False
-) -> dict:
-    """
-    Shape aligns with Hyperliquid's typical 'order' post.
-    You may need to adjust outer keys to match HL exactly.
-    """
-    body = {
-        "type": "order",
-        "order": {
-            "coin": coin,
-            "is_buy": bool(is_buy),
-            "sz": f"{size:.6f}",
-            "limit_px": f"{px:.6f}",
-            "order_type": {"limit": {"tif": tif}},
-            "reduce_only": bool(reduce_only),
-        },
-        "timestamp_ms": int(time.time() * 1000),
-    }
-    return body
-
-
-def _build_trigger_order(
-    *,
-    coin: str,
-    is_buy: bool,
-    size: float,
-    trigger_px: float,
-    kind: str,              # "stop" | "stopMarket" | "takeProfit" | "takeProfitMarket"
-    reduce_only: bool = True
-) -> dict:
-    """
-    Construct a generic trigger-type order payload. Adjust 'kind' naming to HL docs.
-    """
-    body = {
-        "type": "order",
-        "order": {
-            "coin": coin,
-            "is_buy": bool(is_buy),
-            "sz": f"{size:.6f}",
-            "order_type": {
-                "trigger": {
-                    "kind": kind,
-                    "trigger_px": f"{trigger_px:.6f}",
-                    "tif": "Gtc",
-                }
-            },
-            "reduce_only": bool(reduce_only),
-        },
-        "timestamp_ms": int(time.time() * 1000),
-    }
-    return body
-
-
-# =========================
-# FINAL POST (SIGN HERE)
-# =========================
-def _sign_and_post(payload: dict) -> None:
-    """
-    The ONLY piece you need to finish to go live.
-
-    Hyperliquid expects a signed request to its private endpoint (often /exchange).
-    They support EVM-style signing (private key) or an API key scheme.
-
-    Replace this function with the exact signing required by your account setup:
-      - EVM (preferred): sign the canonical message and include signature + address
-      - or API key/secret: include headers they document
-
-    The rest of the module (size calc, entries, TP/SL) is already wired.
-    """
-    url = f"{HL_BASE.rstrip('/')}/exchange"
-
-    # Example skeleton for EVM signing (pseudo — fill per HL doc):
-    # msg = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    # sig = sign_with_evm_key(msg, os.getenv("HYPER_EVM_PRIVKEY"))
-    # headers = {"Content-Type": "application/json"}
-    # body = {"signature": sig, "payload": payload, "address": eth_address_from_key(...)}
-
-    # Until you wire this, raise loudly so nothing silently fails:
-    raise NotImplementedError(
-        "Replace _place_order_real with real HL placement. "
-        "Until then, run with DRY_RUN=true."
-    )
-
-    # With signing in place, do:
-    # with httpx.Client(timeout=HTTP_TIMEOUT) as s:
-        # r = s.post(url, json=body, headers=headers)
-        # r.raise_for_status()
-        # print("[BROKER] POST ok:", r.text)
+    def submit_signal(self, sig: Dict):
+        """
+        Entry point called by execution.py.
+        """
+        try:
+            symbol = sig.get("symbol", "").upper()
+            if self._allowed is not None and symbol not in self._allowed:
+                log.info(f"[BROKE]()
