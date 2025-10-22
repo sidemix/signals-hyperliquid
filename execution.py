@@ -11,6 +11,10 @@ import importlib
 from dataclasses import dataclass
 from typing import Any, List, Tuple, Optional, Union
 
+# example
+docker build --no-cache -t your-image .
+docker run --rm -it --env-file .env your-image
+
 
 # ============================================================
 # Dataclass for structured trade signal
