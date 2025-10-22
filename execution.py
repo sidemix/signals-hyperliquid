@@ -5,7 +5,7 @@ import importlib
 import logging
 import traceback
 from collections import deque
-from typing import Any, Optional, Tuple, List
+from typing import Any, Optional, Tuple, List, Iterable, Iterator
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -14,66 +14,40 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 # -----------------------------------------------------------------------------
-# ExecSignal: robust, accepts ANY kwargs and normalizes common aliases
+# ExecSignal: robust, dict-like container that accepts ANY kwargs and normalizes aliases
 # -----------------------------------------------------------------------------
 class ExecSignal:
     """
     Flexible container for parsed trade signals.
 
-    - Accepts ANY kwargs from upstream parser (no unexpected keyword errors).
-    - Normalizes common aliases (side/direction, symbol/ticker/pair, band/entry_band/range/etc.).
-    - Keeps a copy of all extras in .extras for debugging.
+    - Accepts ANY kwargs from upstream parser.
+    - Normalizes common aliases (side/direction, symbol/ticker/pair, band/entry_band/...).
+    - Exposes canonical fields as attributes AND as a dict-like mapping:
+        sig["stop_loss"], sig.get("stop_loss"), "stop_loss" in sig, for broker compatibility.
     """
 
-    # Known canonical attributes (set defaults for IDEs/type hints)
-    msg_id: Optional[int] = None
-    message_id: Optional[int] = None
-    id: Optional[int] = None
-
-    side: str = ""               # "LONG" | "SHORT"
-    symbol: str = ""             # "ETH/USD" etc.
-
-    # Band (tuple) or scalar low/high variants
-    band: Optional[Tuple[float, float]] = None
-    band_low: Optional[float] = None
-    band_high: Optional[float] = None
-
-    # Risk/targets
-    stop_loss: Optional[float] = None
-    tp_count: Optional[int] = None
-
-    # Extras (accepted but not required)
-    leverage: Optional[int] = None
-    timeframe: str = ""
-
-    # Parsed extras live here
-    extras: dict
-
     def __init__(self, **kwargs: Any) -> None:
-        # Accept everything
-        self.extras = dict(kwargs)
+        # Keep original inputs
+        self._extras = dict(kwargs)
 
-        # --- IDs ----------------------------------------------------------------
+        # ---- IDs --------------------------------------------------------------
         self.msg_id = self._pop_int(kwargs, "msg_id", "message_id", "id")
 
-        # --- Side / Symbol ------------------------------------------------------
+        # ---- Side / Symbol ----------------------------------------------------
         self.side = (self._pop_str(kwargs, "side", "direction") or "").upper()
         self.symbol = self._pop_str(kwargs, "symbol", "ticker", "pair") or ""
 
-        # --- Band (tuple) variants ---------------------------------------------
+        # ---- Band (tuple) variants -------------------------------------------
         band_tuple = self._pop_tuple2(
-            kwargs,
-            "band", "entry_band", "entry", "range", "price_band", "band_bounds"
+            kwargs, "band", "entry_band", "entry", "range", "price_band", "band_bounds"
         )
         # Scalar low/high variants
         band_low = self._pop_float(
-            kwargs,
-            "band_low", "entry_low", "range_low", "lower_band",
+            kwargs, "band_low", "entry_low", "range_low", "lower_band",
             "min_price", "low", "lo", "min",
         )
         band_high = self._pop_float(
-            kwargs,
-            "band_high", "entry_high", "range_high", "upper_band",
+            kwargs, "band_high", "entry_high", "range_high", "upper_band",
             "max_price", "high", "hi", "max",
         )
         if band_tuple is None and band_low is not None and band_high is not None:
@@ -82,21 +56,74 @@ class ExecSignal:
         self.band_low = float(band_low) if band_low is not None else None
         self.band_high = float(band_high) if band_high is not None else None
 
-        # --- Stop loss (handle many aliases, including uppercase "SL") ----------
+        # ---- Stop loss (handle many aliases, including uppercase "SL") --------
         self.stop_loss = self._pop_float(kwargs, "stop_loss", "sl", "SL", "stop", "stopPrice")
 
-        # --- TP count & explicit targets ---------------------------------------
+        # ---- TP count & optional explicit targets ----------------------------
         self.tp_count = self._pop_int(kwargs, "tp_count", "tpn", "tpN", "take_profit_count")
+        self.tps = self._pop_list(kwargs, "tps", "targets", "take_profits", "tp_prices")  # optional list
 
-        # These lists are accepted but not required; broker ignores them if present
-        self.tps = self._pop_list(kwargs, "tps", "targets", "take_profits", "tp_prices")  # type: ignore[attr-defined]
-
-        # --- Leverage / timeframe ----------------------------------------------
+        # ---- Leverage / timeframe --------------------------------------------
         self.leverage = self._pop_int(kwargs, "leverage", "lev", "x")
         self.timeframe = self._pop_str(kwargs, "timeframe", "tf") or ""
 
-        # Keep any remaining fields in .extras
-        self.extras.update(kwargs)
+        # Anything left stays in extras (and will be visible via mapping)
+        self._extras.update(kwargs)
+
+        # ---- Build a canonical mapping that the broker can read like a dict ---
+        self._map = {
+            # ids
+            "msg_id": self.msg_id,
+            "message_id": self.msg_id,
+            "id": self.msg_id,
+            # core
+            "side": self.side,
+            "symbol": self.symbol,
+            # band
+            "band": self.band,
+            "band_low": self.band_low,
+            "band_high": self.band_high,
+            # risk/targets
+            "stop_loss": self.stop_loss,
+            "sl": self.stop_loss,
+            "SL": self.stop_loss,
+            "tp_count": self.tp_count,
+            "tpn": self.tp_count,
+            "tpN": self.tp_count,
+            "take_profit_count": self.tp_count,
+            # extras
+            "leverage": self.leverage,
+            "lev": self.leverage,
+            "x": self.leverage,
+            "timeframe": self.timeframe,
+            "tf": self.timeframe,
+            "tps": self.tps,
+        }
+        # Merge any remaining original fields without trampling canonicals
+        for k, v in self._extras.items():
+            self._map.setdefault(k, v)
+
+    # ---------- dict-like interface so broker can use sig[...] / sig.get(...) ----------
+    def __getitem__(self, key: str) -> Any:
+        return self._map[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._map.get(key, default)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._map
+
+    def keys(self) -> Iterable[str]:
+        return self._map.keys()
+
+    def items(self) -> Iterable[tuple[str, Any]]:
+        return self._map.items()
+
+    def values(self) -> Iterable[Any]:
+        return self._map.values()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._map)
 
     # ---------- helpers to pop typed values from kwargs ----------
     def _pop_str(self, d: dict, *keys: str) -> Optional[str]:
@@ -157,18 +184,16 @@ class ExecSignal:
                 v = d.pop(k)
                 if isinstance(v, list):
                     return v
-                # allow comma-separated strings
                 if isinstance(v, str):
-                    parts = [p.strip() for p in v.split(",")]
-                    return parts
+                    return [p.strip() for p in v.split(",")]
         return None
 
+    # ---------- pretty repr for your logs ----------
     def __repr__(self) -> str:
-        # Build a concise string like your logs
         band_txt = None
         if self.band is not None:
             try:
-                band_txt = f"({float(self.band[0]):.2f}, {float(self.band[1]):.2f})"
+                band_txt = f"({float(self.band[0]):.6f}, {float(self.band[1]):.6f})"
             except Exception:
                 band_txt = str(self.band)
 
@@ -188,20 +213,14 @@ class ExecSignal:
             parts.append(f"TF={self.timeframe}")
         return f"<ExecSignal {' '.join(parts)}>"
 
-
 # -----------------------------------------------------------------------------
 # Dedupe for Discord message IDs (prevents double-runs on the same signal)
 # -----------------------------------------------------------------------------
 _SEEN_MSG_IDS = set()
 _SEEN_ORDER = deque(maxlen=500)  # keep a rolling window of recent ids
 
-
 def _get_msg_id(sig: Any) -> Optional[int]:
-    """
-    Attempts to extract a stable message id from the parsed signal.
-    We try common attributes/keys: msg_id, message_id, id.
-    """
-    # Attribute or attribute-like access
+    # attribute
     for name in ("msg_id", "message_id", "id"):
         try:
             if hasattr(sig, name):
@@ -212,25 +231,22 @@ def _get_msg_id(sig: Any) -> Optional[int]:
                     return int(val)
         except Exception:
             pass
-    # Dict style
-    if isinstance(sig, dict):
+    # mapping style
+    if isinstance(sig, dict) or hasattr(sig, "get"):
         for name in ("msg_id", "message_id", "id"):
-            if name in sig:
-                try:
-                    val = sig[name]
-                    if isinstance(val, int):
-                        return val
-                    if isinstance(val, str) and (val.isdigit() or (val.startswith("-") and val[1:].isdigit())):
-                        return int(val)
-                except Exception:
-                    pass
+            try:
+                val = sig.get(name)  # type: ignore[attr-defined]
+                if val is None:
+                    continue
+                if isinstance(val, int):
+                    return val
+                if isinstance(val, str) and (val.isdigit() or (val.startswith("-") and val[1:].isdigit())):
+                    return int(val)
+            except Exception:
+                pass
     return None
 
-
 def _already_processed(msg_id: Optional[int]) -> bool:
-    """
-    Returns True if we've handled this message id recently.
-    """
     if msg_id is None:
         return False
     if msg_id in _SEEN_MSG_IDS:
@@ -238,21 +254,15 @@ def _already_processed(msg_id: Optional[int]) -> bool:
         return True
     _SEEN_MSG_IDS.add(msg_id)
     _SEEN_ORDER.append(msg_id)
-    # Keep sets bounded
     if len(_SEEN_MSG_IDS) > _SEEN_ORDER.maxlen:
         old = _SEEN_ORDER.popleft()
         _SEEN_MSG_IDS.discard(old)
     return False
 
-
 # -----------------------------------------------------------------------------
 # Broker loader
 # -----------------------------------------------------------------------------
 def _get_broker_submit():
-    """
-    Dynamically import the Hyperliquid broker and return its submit_signal().
-    Shows a friendly traceback if import fails.
-    """
     try:
         mod = importlib.import_module("broker.hyperliquid")
         if not hasattr(mod, "submit_signal"):
@@ -262,17 +272,12 @@ def _get_broker_submit():
         tb = traceback.format_exc()
         raise RuntimeError(f"Broker import failed:\n{tb}")
 
-
 # -----------------------------------------------------------------------------
-# Pretty summaries for logs (optional)
+# Pretty summaries for logs
 # -----------------------------------------------------------------------------
 def _summarize(sig: Any) -> str:
-    """
-    Best-effort summary line for logs. Reads both canonical attrs and extras.
-    """
     def read_any(obj: Any, *names, default=None):
         for n in names:
-            # attribute
             if hasattr(obj, n):
                 try:
                     v = getattr(obj, n)
@@ -280,24 +285,25 @@ def _summarize(sig: Any) -> str:
                         return v
                 except Exception:
                     pass
-            # dict-like
             if isinstance(obj, dict) and n in obj and obj[n] is not None:
                 return obj[n]
-            # ExecSignal extras
-            if hasattr(obj, "extras") and isinstance(obj.extras, dict) and n in obj.extras and obj.extras[n] is not None:
-                return obj.extras[n]
+            if hasattr(obj, "get"):
+                try:
+                    v = obj.get(n)  # type: ignore[attr-defined]
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
         return default
 
     side = (read_any(sig, "side", "direction") or "").upper()
     symbol = read_any(sig, "symbol", "ticker", "pair") or ""
-
     band = read_any(sig, "band", "entry_band", "entry", "range", "price_band", "band_bounds")
     if band is None:
         lo = read_any(sig, "band_low", "entry_low", "range_low", "lower_band", "min_price", "low", "lo", "min")
         hi = read_any(sig, "band_high", "entry_high", "range_high", "upper_band", "max_price", "high", "hi", "max")
         if lo is not None and hi is not None:
             band = (float(lo), float(hi))
-
     sl = read_any(sig, "stop_loss", "sl", "SL", "stop", "stopPrice")
     tpn = read_any(sig, "tp_count", "tpn", "tpN", "take_profit_count")
     lev = read_any(sig, "leverage", "lev", "x")
@@ -321,20 +327,12 @@ def _summarize(sig: Any) -> str:
         parts.append(f"lev={lev}")
     if tf:
         parts.append(f"TF={tf}")
-    detail = " ".join(parts)
-    return f"{head} {detail}".strip()
-
+    return f"{head} {' '.join(parts)}".strip()
 
 # -----------------------------------------------------------------------------
 # Public entry point
 # -----------------------------------------------------------------------------
 def execute_signal(sig: Any) -> None:
-    """
-    Top-level coordinator called by your Discord handler after a signal is parsed.
-    - Dedupes by Discord message id
-    - Loads broker once per run and submits
-    - Surfaces clear error messages while preserving traceback for debugging
-    """
     msg_id = _get_msg_id(sig)
     if _already_processed(msg_id):
         return
@@ -356,20 +354,17 @@ def execute_signal(sig: Any) -> None:
         log.error("Submit traceback:\n%s", traceback.format_exc())
         raise
 
-
 # -----------------------------------------------------------------------------
 # Local smoke test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Test: uppercase SL and extra tps
     s = ExecSignal(
         msg_id=1,
-        side="SHORT",
-        symbol="ETH/USD",
-        entry_band=(3875.33, 3877.16),
-        SL=3899.68,                     # uppercase alias
-        tpn=6,
-        tps=[3870, 3865, 3860],         # extra field accepted
+        side="LONG",
+        symbol="ARB/USD",
+        entry_band=(0.310381, 0.310702),
+        SL=0.306424,          # uppercase supported
+        tpn=1,
         lev=20,
         tf="5m",
     )
