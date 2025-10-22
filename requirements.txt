@@ -3,7 +3,11 @@ python-dotenv==1.0.1
 httpx==0.27.2
 pydantic==2.9.2
 
-# Hyperliquid SDK + signing
-hyperliquid_python_sdk==0.20.0
-eth-account>=0.9,<0.11
+
+
+hyperliquid-python-sdk>=2.0.0
+requests>=2.31.0
+websockets>=12.0
+eth-account>=0.10.0
+
 
