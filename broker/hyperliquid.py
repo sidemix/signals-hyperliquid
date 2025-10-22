@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import math
 import time
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -11,7 +10,7 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 # ---------------------------------------------------------------------------------
-# Optional SDK imports (we'll still run in DRY_RUN if missing or misconfigured)
+# Optional SDK imports (still runs in DRY_RUN if missing)
 # ---------------------------------------------------------------------------------
 try:
     from hyperliquid.info import Info   # type: ignore
@@ -35,17 +34,21 @@ else:
     ALLOWED_SET = {s.strip().upper() for s in RAW_ALLOW.split(",") if s.strip()}
 
 # Size / risk
-NOTIONAL_USD = float(os.getenv("HYPER_NOTIONAL_USD", "50"))  # straightforward fixed notional
+NOTIONAL_USD = float(os.getenv("HYPER_NOTIONAL_USD", "50"))   # fixed notional
 DEFAULT_LEV = int(float(os.getenv("HYPER_DEFAULT_LEVERAGE", "20")))
-TIF = os.getenv("HYPER_TIF", "Gtc").capitalize()  # Alo | Ioc | Gtc
+TIF = os.getenv("HYPER_TIF", "Gtc").capitalize()              # Alo | Ioc | Gtc
 DRY_RUN = os.getenv("HYPER_DRY_RUN", "true").lower() != "false"
 
 # Network (for Info base_url selection; sdk may handle defaults)
-NETWORK = os.getenv("HYPER_NETWORK", "mainnet").lower()  # "mainnet" | "testnet"
+NETWORK = os.getenv("HYPER_NETWORK", "mainnet").lower()       # "mainnet" | "testnet"
 
-# If you want to place real orders via the SDK (you also need to configure signing):
-AGENT_PRIVATE_KEY = os.getenv("HYPER_AGENT_PRIVATE_KEY")  # hex key (danger: keep safe!)
-VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "")      # optional subaccount/vault
+# Real placement config (if DRY_RUN=false)
+AGENT_PRIVATE_KEY = os.getenv("HYPER_AGENT_PRIVATE_KEY")      # hex key (keep safe)
+VAULT_ADDRESS     = os.getenv("HYPER_VAULT_ADDRESS", "")      # optional subaccount/vault
+
+# Singletons (prevents repeated WS connects)
+_INFO_SINGLETON: Optional[Any] = None
+_EX_SINGLETON: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------------
@@ -58,7 +61,7 @@ def _symbol_allowed(symbol: str) -> bool:
 
 
 def _symbol_to_coin(symbol: str) -> str:
-    """'ETH/USD' -> 'ETH', 'APEX/USD' -> 'APEX'"""
+    """'ETH/USD' -> 'ETH'"""
     s = symbol.upper().strip()
     if "/" in s:
         return s.split("/")[0]
@@ -66,16 +69,33 @@ def _symbol_to_coin(symbol: str) -> str:
 
 
 def _get_info() -> Optional[Any]:
-    """Construct an Info client if available."""
+    """Construct/cached an Info client if available."""
+    global _INFO_SINGLETON
+    if _INFO_SINGLETON is not None:
+        return _INFO_SINGLETON
     if Info is None:
         return None
     try:
-        if NETWORK.startswith("test"):
-            return Info(base_url="https://api.hyperliquid-testnet.xyz")
-        return Info(base_url="https://api.hyperliquid.xyz")
+        base = "https://api.hyperliquid-testnet.xyz" if NETWORK.startswith("test") else "https://api.hyperliquid.xyz"
+        _INFO_SINGLETON = Info(base_url=base)
+        return _INFO_SINGLETON
     except Exception as e:
         log.warning(f"[BROKER] Info init failed: {e}")
         return None
+
+
+def _get_exchange() -> Any:
+    """Only needed when HYPER_DRY_RUN=false."""
+    global _EX_SINGLETON
+    if _EX_SINGLETON is not None:
+        return _EX_SINGLETON
+    if Exchange is None:
+        raise RuntimeError("hyperliquid-python-sdk not available; cannot place orders.")
+    if not AGENT_PRIVATE_KEY:
+        raise RuntimeError("HYPER_AGENT_PRIVATE_KEY env is required for real placement.")
+    base = "https://api.hyperliquid-testnet.xyz" if NETWORK.startswith("test") else "https://api.hyperliquid.xyz"
+    _EX_SINGLETON = Exchange(AGENT_PRIVATE_KEY, base_url=base)
+    return _EX_SINGLETON
 
 
 def _get_meta(info: Any) -> Optional[Dict[str, Any]]:
@@ -87,16 +107,17 @@ def _get_meta(info: Any) -> Optional[Dict[str, Any]]:
 
 
 def _asset_index(info: Any, coin: str) -> Optional[int]:
-    """Perps: asset = index in meta['universe'] where coin matches."""
+    """Perps: asset = index in meta['universe'] where name/coin matches."""
     meta = _get_meta(info)
     if not meta or "universe" not in meta:
         return None
     uni = meta["universe"]
     for idx, u in enumerate(uni):
         try:
-            if (u.get("name") or u.get("asset") or u.get("coin") or "").upper() == coin.upper():
+            name = (u.get("name") or u.get("asset") or u.get("coin") or "").upper()
+            if name == coin.upper():
                 return idx
-            # some SDKs keep 'name' as the coin symbol; fallback: compare 'indexSymbol' if present
+            # sometimes 'indexSymbol' is used
             if str(u.get("indexSymbol", "")).upper() == coin.upper():
                 return idx
         except Exception:
@@ -141,15 +162,16 @@ def _get_mark_price(coin: str) -> Optional[float]:
     except Exception as e:
         log.warning(f"WARNING:broker.hyperliquid:all_mids failed for {coin}: {e}")
 
-    # 3) l2Book midpoint
+    # 3) l2Book midpoint (if available in current SDK)
     try:
-        book = info.l2_book(coin, nSigFigs=5, mantissa=None) if hasattr(info, "l2_book") else None
-        if book and "levels" in book and book["levels"]:
-            bids, asks = book["levels"][0], book["levels"][1]
-            best_bid = float(bids[0]["px"]) if bids else None
-            best_ask = float(asks[0]["px"]) if asks else None
-            if best_bid and best_ask:
-                return (best_bid + best_ask) / 2.0
+        if hasattr(info, "l2_book"):
+            book = info.l2_book(coin, nSigFigs=5, mantissa=None)
+            if book and "levels" in book and book["levels"]:
+                bids, asks = book["levels"][0], book["levels"][1]
+                best_bid = float(bids[0]["px"]) if bids else None
+                best_ask = float(asks[0]["px"]) if asks else None
+                if best_bid and best_ask:
+                    return (best_bid + best_ask) / 2.0
     except Exception:
         pass
 
@@ -182,14 +204,12 @@ def _fmt_px_sz_for_perp(
     # Price rounding: max_decimals = 6 - szDecimals (integer prices always fine)
     max_decimals = max(0, 6 - sz_dec)
     if px >= 1:
-        # Keep integer if big number; else limit decimals
         px_rounded = round(float(px), max_decimals)
         if px_rounded.is_integer():
             px_str = f"{int(px_rounded)}"
         else:
             px_str = f"{px_rounded:.{max_decimals}f}"
     else:
-        # For small prices, just cap decimals to max_decimals (may be many leading zeros)
         px_rounded = round(float(px), max_decimals)
         px_str = f"{px_rounded:.{max_decimals}f}"
 
@@ -210,7 +230,6 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
     Optional:
       - tp_count, leverage, timeframe
     """
-    # read helper that tries attribute / mapping
     def read(*names, default=None):
         for n in names:
             if hasattr(sig, n):
@@ -236,7 +255,6 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
     if not side or not symbol:
         raise ValueError("Signal missing side/symbol.")
 
-    # band
     band = (
         read("band") or read("entry_band") or read("entry") or
         read("range") or read("price_band") or read("band_bounds")
@@ -278,18 +296,16 @@ def _build_order_plan(
     """
     Decide entry price and size.
     Current logic:
-      - px_entry: mid of band (safe, within signal’s bracket)
+      - LONG  -> px_entry = band_low
+      - SHORT -> px_entry = band_high
       - size: base size so that notional ~= NOTIONAL_USD
     """
     low, high = band
-    px_entry = (low + high) / 2.0
+    px_entry = float(low) if side == "LONG" else float(high)
 
-    # notional in USD -> base size
     if px_entry <= 0:
         raise RuntimeError("Entry price invalid (<= 0).")
     base_sz = NOTIONAL_USD / px_entry
-
-    # Ensure positive size
     base_sz = max(base_sz, 10 ** -6)
 
     info = _get_info()
@@ -319,24 +335,11 @@ def _place_order_real(
     Place a single LIMIT order using the SDK's Exchange client.
     NOTE:
       - You MUST provide AGENT_PRIVATE_KEY in env for signing.
-      - This function is minimal; adapt tif / cloid / grouping as needed.
     """
     if DRY_RUN:
         raise RuntimeError("DRY_RUN is enabled; refusing to place a real order.")
 
-    if Exchange is None or Info is None:
-        raise RuntimeError("hyperliquid-python-sdk not available; cannot place orders.")
-
-    if not AGENT_PRIVATE_KEY:
-        raise RuntimeError("HYPER_AGENT_PRIVATE_KEY env is required for real placement.")
-
-    # Init clients
-    if NETWORK.startswith("test"):
-        info = Info(base_url="https://api.hyperliquid-testnet.xyz")
-        ex = Exchange(AGENT_PRIVATE_KEY, base_url="https://api.hyperliquid-testnet.xyz")
-    else:
-        info = Info(base_url="https://api.hyperliquid.xyz")
-        ex = Exchange(AGENT_PRIVATE_KEY, base_url="https://api.hyperliquid.xyz")
+    ex = _get_exchange()
 
     # Build order payload (limit)
     order = {
@@ -356,8 +359,8 @@ def _place_order_real(
 
     nonce = int(time.time() * 1000)
 
-    # Exchange client hides signing; but some SDK versions accept direct payloads
     try:
+        # Exchange client typically handles signing internally
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[attr-defined]
         return {"status": "ok", "response": resp}
     except Exception as e:
@@ -384,10 +387,10 @@ def submit_signal(sig: Any) -> None:
 
     print(f"[BROKER] {side} {symbol} band=({band[0]:.6f},{band[1]:.6f}) SL={stop_loss} lev={lev} TIF={TIF}")
 
-    # Ensure we have a mark (not mandatory for current sizing, but useful logs)
+    # Mark (informational)
     mark = _get_mark_price(coin)
     if mark is None:
-        print(f"[PRICE] mark fetch failed for {coin}; proceeding with entry midpoint.")
+        print(f"[PRICE] mark fetch failed for {coin}; proceeding with band edge entry.")
     else:
         print(f"[PRICE] {coin} mark={mark}")
 
