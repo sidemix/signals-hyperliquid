@@ -327,7 +327,8 @@ def _place_order_real(
     *,
     side: str,
     coin: str,
-    asset: int,
+    asset_idx: int | None = None,   # <— accept asset_idx
+    asset: int | None = None,       # <— and asset (back-compat)
     px: str,
     sz: str,
     tif: str,
@@ -335,40 +336,38 @@ def _place_order_real(
 ) -> dict:
     """
     Place a real order via the HL SDK.
-    Supports both SDK call shapes:
-      - NEWER: ex.order(action, nonce=..., vaultAddress=...)
-      - LEGACY (0.20.x): ex.order({"action": action, "nonce": ..., "vaultAddress": ...})
+    Accepts either `asset_idx` or `asset`.
+    Works with both newer and legacy SDK signatures.
     """
+    a = asset_idx if asset_idx is not None else asset
+    if a is None:
+        raise ValueError("asset index is required")
+
     nonce = int(time.time() * 1000)
 
-    # Build the "action" object (SDK expects this exact shape)
     action = {
         "type": "order",
         "orders": [{
-            "a": asset,                       # asset index
-            "b": (side.upper() == "BUY"),     # isBuy
-            "p": px,                          # price (string)
-            "s": sz,                          # size  (string)
-            "r": reduce_only,                 # reduceOnly
-            "t": {"limit": {"tif": tif}},     # time-in-force
+            "a": a,                               # <-- asset index
+            "b": (side.upper() == "BUY"),
+            "p": px,
+            "s": sz,
+            "r": reduce_only,
+            "t": {"limit": {"tif": tif}},
         }],
         "grouping": "na",
     }
 
-    # Try the new signature first; fall back to legacy payload if needed.
+    # Try newer SDK signature first; fallback to legacy payload
     try:
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
     except TypeError:
-        # Older SDK (0.20.x) expects a single dict payload
         payload = {"action": action, "nonce": nonce}
         if VAULT_ADDRESS:
             payload["vaultAddress"] = VAULT_ADDRESS
         resp = ex.order(payload)
 
-    # Optional: sanity log
     log.info(f"[BROKER] order response: {resp}")
-
-    # Basic error check like before (keep your existing validator if you have one)
     if not isinstance(resp, dict) or resp.get("status") != "ok":
         raise RuntimeError(f"Order rejected by API: {resp}")
     return resp
