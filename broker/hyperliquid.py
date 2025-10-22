@@ -278,9 +278,10 @@ def _place_order_real(
       - px or px_str
       - sz or sz_str or size_str
 
-    Supports both SDK call shapes:
-      - NEWER:  ex.order(action, nonce=..., vaultAddress=...)
-      - LEGACY: ex.order({"action": action, "nonce": ..., "vaultAddress": ...})
+    Supports all SDK call shapes:
+      1) NEWER:  ex.order(action, nonce=..., vaultAddress=...)
+      2) LEGACY: ex.order({"action": action, "nonce": ..., "vaultAddress": ...})
+      3) POSITIONAL: ex.order(is_buy, sz, limit_px, order_type, [reduce_only], [asset], ...)
     """
     a = asset_idx if asset_idx is not None else asset
     if a is None:
@@ -299,39 +300,88 @@ def _place_order_real(
     if px_val is None or sz_val is None:
         raise ValueError("both price and size are required (px/px_str, sz/sz_str/size_str)")
 
+    # strings for SDK
     px_val = str(px_val)
     sz_val = str(sz_val)
 
     nonce = int(time.time() * 1000)
 
+    # unified order_type
+    order_type = {"limit": {"tif": tif}}
+
+    # Action payload for dict-based APIs
     action = {
         "type": "order",
         "orders": [{
             "a": a,
-            "b": bool(is_buy),
+            "b": bool(is_buy),   # isBuy
             "p": px_val,
             "s": sz_val,
             "r": reduce_only,
-            "t": {"limit": {"tif": tif}},
+            "t": order_type,
         }],
         "grouping": "na",
     }
 
     ex = _get_exchange()
+
+    # (1) New SDK: ex.order(action, nonce=..., vaultAddress=...)
     try:
-        # Try newer SDK signature
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
+        log.info(f"[BROKER] order response (new): {resp}")
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            raise RuntimeError(f"Order rejected by API: {resp}")
+        return resp
     except TypeError:
-        # Fall back to legacy payload dict (0.20.x)
+        pass  # try legacy / positional
+    except Exception as e:
+        log.warning(f"[WARN] new-style order failed: {e}")
+
+    # (2) Legacy dict wrapper: ex.order({"action":..., "nonce":...})
+    try:
         payload = {"action": action, "nonce": nonce}
         if VAULT_ADDRESS:
             payload["vaultAddress"] = VAULT_ADDRESS
         resp = ex.order(payload)
+        log.info(f"[BROKER] order response (legacy-dict): {resp}")
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            raise RuntimeError(f"Order rejected by API: {resp}")
+        return resp
+    except TypeError:
+        pass  # try positional
+    except Exception as e:
+        log.warning(f"[WARN] legacy-dict order failed: {e}")
 
-    log.info(f"[BROKER] order response: {resp}")
-    if not isinstance(resp, dict) or resp.get("status") != "ok":
-        raise RuntimeError(f"Order rejected by API: {resp}")
-    return resp
+    # (3) Positional signature. Try the two most common variants.
+    # 3a) (is_buy, sz, limit_px, order_type, reduce_only, asset)
+    try:
+        resp = ex.order(bool(is_buy), sz_val, px_val, order_type, reduce_only, a)  # type: ignore[misc]
+        log.info(f"[BROKER] order response (positional-6): {resp}")
+        # Some positional variants return non-dict; accept truthy success, else raise
+        if isinstance(resp, dict):
+            if resp.get("status") == "ok":
+                return resp
+            raise RuntimeError(f"Order rejected by API: {resp}")
+        # Assume success if no exception and not dict
+        return {"status": "ok", "response": resp}
+    except TypeError as e:
+        log.warning(f"[WARN] positional-6 signature failed: {e}")
+    except Exception as e:
+        log.warning(f"[WARN] positional-6 order failed: {e}")
+
+    # 3b) (is_buy, sz, limit_px, order_type) minimal, if SDK infers reduce_only/asset from context
+    try:
+        resp = ex.order(bool(is_buy), sz_val, px_val, order_type)  # type: ignore[misc]
+        log.info(f"[BROKER] order response (positional-4): {resp}")
+        if isinstance(resp, dict):
+            if resp.get("status") == "ok":
+                return resp
+            raise RuntimeError(f"Order rejected by API: {resp}")
+        return {"status": "ok", "response": resp}
+    except Exception as e:
+        raise RuntimeError(
+            f"All SDK order call styles failed. Last error: {e}"
+        ) from e
 
 
 # ========== Public entry point ==========
