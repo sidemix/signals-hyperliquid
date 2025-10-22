@@ -327,54 +327,62 @@ def _build_order_plan(
 def _place_order_real(
     *,
     coin: str,
-    # accept either asset_idx or asset
+    # asset synonyms
     asset_idx: int | None = None,
     asset: int | None = None,
-    # accept either side (str) or is_buy (bool)
+    # side synonyms
     side: str | None = None,
     is_buy: bool | None = None,
-    px: str,
-    sz: str,
+    # price/size synonyms
+    px: str | None = None,
+    px_str: str | None = None,
+    sz: str | None = None,
+    size_str: str | None = None,
     tif: str,
     reduce_only: bool,
 ) -> dict:
     """
     Place a real order via the HL SDK.
-    - Accepts `asset_idx` or `asset`
-    - Accepts `side` ("BUY"/"SELL"/"LONG"/"SHORT") or `is_buy` (bool)
-    - Works with both newer and legacy SDK .order(..) signatures
+    Accepts either asset_idx/asset, side/is_buy, px/px_str, sz/size_str.
+    Works with both newer and legacy SDK .order(..) signatures.
     """
+    # --- normalize asset ---
     a = asset_idx if asset_idx is not None else asset
     if a is None:
         raise ValueError("asset index is required")
 
-    # normalize buy flag
+    # --- normalize side/is_buy ---
     if is_buy is None:
         if side is None:
             raise ValueError("either `side` or `is_buy` must be provided")
         side_u = side.upper()
         is_buy = side_u in ("BUY", "LONG")
 
+    # --- normalize px / sz ---
+    px_val = px_str if px_str is not None else px
+    sz_val = size_str if size_str is not None else sz
+    if px_val is None or sz_val is None:
+        raise ValueError("both price and size are required (px/px_str, sz/size_str)")
+
     nonce = int(time.time() * 1000)
 
     action = {
         "type": "order",
         "orders": [{
-            "a": a,                 # asset index
-            "b": bool(is_buy),      # isBuy
-            "p": px,                # price (string)
-            "s": sz,                # size  (string)
-            "r": reduce_only,       # reduceOnly
+            "a": a,
+            "b": bool(is_buy),
+            "p": str(px_val),
+            "s": str(sz_val),
+            "r": reduce_only,
             "t": {"limit": {"tif": tif}},
         }],
         "grouping": "na",
     }
 
+    # Try newer SDK signature first; fallback to legacy payload dict
     try:
-        # newer SDK
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
     except TypeError:
-        # legacy SDK (0.20.x)
         payload = {"action": action, "nonce": nonce}
         if VAULT_ADDRESS:
             payload["vaultAddress"] = VAULT_ADDRESS
