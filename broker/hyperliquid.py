@@ -1,204 +1,256 @@
 # broker/hyperliquid.py
-
 from __future__ import annotations
 
 import os
 import time
+import math
 import logging
-from typing import Any, Dict, Optional, Set, Tuple, List
-
-from hyperliquid.info import Info
-from hyperliquid.exchange import Exchange
-
-try:
-    from eth_account import Account  # for banner
-except Exception:
-    Account = None  # type: ignore
+from typing import Any, Dict, Optional, Tuple
 
 log = logging.getLogger("broker.hyperliquid")
 if not log.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    h = logging.StreamHandler()
+    fmt = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+    h.setFormatter(fmt)
+    log.addHandler(h)
+log.setLevel(logging.INFO)
 
+# -----------------------
+# Environment & constants
+# -----------------------
 
-# ========= Env helpers =========
-def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip()
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
+def _getenv_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
     if v is None:
         return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+    v = v.strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
 
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None:
-        return default
+def _getenv_float(key: str, default: float) -> float:
     try:
-        return float(v)
+        return float(os.getenv(key, "").strip() or default)
     except Exception:
         return default
 
+HYPER_DRY_RUN = _getenv_bool("HYPER_DRY_RUN", False) or _getenv_bool("hyper_dry_run", False)
+HL_NETWORK = (os.getenv("HL_NETWORK") or os.getenv("HYPER_NETWORK") or "mainnet").strip().lower()
+USER_ADDRESS = (os.getenv("HL_ADDRESS") or os.getenv("HYPER_USER_ADDRESS") or "").strip() or None
+VAULT_ADDRESS = (os.getenv("HL_VAULT_ADDRESS") or os.getenv("HYPER_VAULT_ADDRESS") or "").strip() or None
 
-# ========= Config =========
-DRY_RUN = _env_bool("HYPER_DRY_RUN", _env_bool("DRY_RUN", True))
-NETWORK = _env_str("HYPER_NETWORK", "mainnet").lower()
-NOTIONAL_USD = _env_float("HYPER_NOTIONAL_USD", 50.0)
+# Agent/API wallet private key (hex with 0x prefix)
+AGENT_WALLET_PK = (
+    os.getenv("HL_AGENT_WALLET_PK")
+    or os.getenv("HL_API_WALLET_PK")
+    or os.getenv("HYPER_AGENT_PK")
+    or os.getenv("HYPER_API_WALLET_PK")
+    or os.getenv("HL_PRIVATE_KEY")   # fallback if user stored here
+    or os.getenv("HYPER_PRIVATE_KEY")
+    or ""
+).strip()
 
-TIF = _env_str("HYPER_TIF", "Gtc").capitalize()
-if TIF not in ("Gtc", "Ioc", "Alo"):
-    log.warning(f"[WARN] HYPER_TIF={TIF} invalid; defaulting to Gtc")
-    TIF = "Gtc"
+DEFAULT_TIF = (os.getenv("HYPER_DEFAULT_TIF") or "Gtc").strip()
+ALLOWED = (os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS") or "").strip()
+ALLOWED_SET = set([s.strip().upper() for s in ALLOWED.split(",") if s.strip()])
 
-AGENT_PRIVATE_KEY = _env_str("HYPER_AGENT_PRIVATE_KEY", "")
-VAULT_ADDRESS = _env_str("HYPER_VAULT_ADDRESS", "").lower() or None
+USD_PER_ORDER = _getenv_float("HYPER_ORDER_USD_AMT", 50.0)
 
-_only_exec = _env_str("HYPER_ONLY_EXECUTE_SYMBOLS", "*")
-if _only_exec == "*":
-    ONLY_EXECUTE_SYMBOLS: Optional[Set[str]] = None
-else:
-    ONLY_EXECUTE_SYMBOLS = {s.strip().upper() for s in _only_exec.split(",") if s.strip()}
+# -----------
+# SDK wiring
+# -----------
 
-BASE_URL = "https://api.hyperliquid-testnet.xyz" if NETWORK == "testnet" else "https://api.hyperliquid.xyz"
+_EXC: Optional[Any] = None
+_INFO: Optional[Any] = None
+_CHAIN = None
 
-_info: Optional[Info] = None
-_ex: Optional[Exchange] = None
-
-
-def _get_info() -> Info:
-    global _info
-    if _info is None:
-        _info = Info(base_url=BASE_URL)
-    return _info
-
-
-def _get_exchange() -> Exchange:
-    global _ex
-    if _ex is None:
-        if not AGENT_PRIVATE_KEY and not DRY_RUN:
-            raise RuntimeError("HYPER_AGENT_PRIVATE_KEY is required when HYPER_DRY_RUN=false")
-        _ex = Exchange(AGENT_PRIVATE_KEY or "0x" + "0" * 64, base_url=BASE_URL)
-    return _ex
-
-
-def _print_mode_banner() -> None:
-    mode = "DRY_RUN" if DRY_RUN else "LIVE"
-    agent_addr = None
-    if Account and AGENT_PRIVATE_KEY:
-        try:
-            agent_addr = Account.from_key(AGENT_PRIVATE_KEY).address
-        except Exception:
-            agent_addr = None
-    if agent_addr:
-        print(f"[MODE] {mode} with agent={agent_addr}{' (vault=' + VAULT_ADDRESS + ')' if VAULT_ADDRESS else ''}")
+def _resolve_chain() -> Any:
+    global _CHAIN
+    if _CHAIN is not None:
+        return _CHAIN
+    try:
+        from hyperliquid.exchange import Chain
+    except Exception:
+        # fallback name in some older builds
+        class _C:
+            MAINNET = "mainnet"
+            TESTNET = "testnet"
+        Chain = _C  # type: ignore
+    if HL_NETWORK in ("testnet", "hl-testnet", "tn"):
+        _CHAIN = getattr(__import__("hyperliquid.exchange", fromlist=["Chain"]), "Chain").TESTNET if hasattr(getattr(__import__("hyperliquid.exchange", fromlist=["Chain"]), "Chain"), "TESTNET") else "testnet"
     else:
-        print(f"[MODE] {mode}{' (no agent key loaded)' if not AGENT_PRIVATE_KEY else ''}")
+        _CHAIN = getattr(__import__("hyperliquid.exchange", fromlist=["Chain"]), "Chain").MAINNET if hasattr(getattr(__import__("hyperliquid.exchange", fromlist=["Chain"]), "Chain"), "MAINNET") else "mainnet"
+    return _CHAIN
 
-
-_print_mode_banner()
-
-
-# ========= Utils =========
-_ASSET_CACHE: Dict[str, int] = {}
-_UID_SEEN: Set[str] = set()
-
-
-def _symbol_to_coin(symbol: str) -> str:
-    s = symbol.strip().upper()
-    return s.split("/")[0] if "/" in s else s
-
-
-def _coin_to_asset_idx(coin: str) -> int:
-    coin_u = coin.upper()
-    if coin_u in _ASSET_CACHE:
-        return _ASSET_CACHE[coin_u]
-    info = _get_info()
-    meta = info.meta()
-    universe = meta.get("universe", [])
-    for idx, entry in enumerate(universe):
-        name = str(entry.get("name", "")).upper()
-        if name == coin_u:
-            _ASSET_CACHE[coin_u] = idx
-            return idx
-    raise RuntimeError(f"Asset index not found for coin={coin_u}")
-
-
-def _get_mark_price(coin: str, fallback_px: Optional[float] = None) -> Optional[float]:
-    info = _get_info()
+def _get_info():
+    """Construct (and cache) an Info client."""
+    global _INFO
+    if _INFO is not None:
+        return _INFO
+    chain = _resolve_chain()
     try:
-        mids = info.all_mids()
-        if isinstance(mids, dict):
-            inner = mids.get("mids", mids)
-            val = inner.get(coin.upper())
-            if val is not None:
-                return float(val)
-    except Exception as e:
-        log.warning(f"[WARN] all_mids failed for {coin}: {e}")
+        from hyperliquid.info import Info
+        _INFO = Info(chain)
+        return _INFO
+    except TypeError:
+        # Some SDKs accept a base_url instead of Chain
+        try:
+            from hyperliquid.info import Info
+            base = "https://api.hyperliquid-testnet.xyz" if str(chain).lower().endswith("testnet") else "https://api.hyperliquid.xyz"
+            _INFO = Info(base)
+            return _INFO
+        except Exception as e:
+            raise RuntimeError(f"Unable to construct Info client: {e}") from e
+
+def _get_exchange():
+    """Construct (and cache) an Exchange client using the agent/API wallet PK."""
+    global _EXC
+    if _EXC is not None:
+        return _EXC
+
+    if not AGENT_WALLET_PK:
+        raise RuntimeError("No agent/API wallet private key set. Populate HL_AGENT_WALLET_PK (or HL_PRIVATE_KEY).")
+
+    chain = _resolve_chain()
+
+    # Try a few constructor signatures
+    from hyperliquid.exchange import Exchange
+    exc: Optional[Any] = None
+    err: Optional[Exception] = None
+
+    # 1) Newer SDKs
     try:
-        trades = info.recent_trades(coin.upper(), n=1)
-        if isinstance(trades, list) and trades:
-            px = trades[0].get("px")
-            if px is not None:
-                return float(px)
+        exc = Exchange(private_key=AGENT_WALLET_PK, chain=chain)  # type: ignore
+        _EXC = exc
+        return _EXC
     except Exception as e:
-        log.warning(f"[WARN] recent_trades failed for {coin}: {e}")
-    return fallback_px
+        err = e
 
+    # 2) Some builds want 'key' instead of 'private_key'
+    try:
+        exc = Exchange(key=AGENT_WALLET_PK, chain=chain)  # type: ignore
+        _EXC = exc
+        return _EXC
+    except Exception as e:
+        err = e
 
-def _compute_size_from_notional(notional_usd: float, px: Optional[float]) -> Optional[float]:
-    if px is None or px <= 0:
-        return None
-    return notional_usd / px
+    # 3) Some builds accept (private_key, account_address, chain)
+    try:
+        if USER_ADDRESS:
+            exc = Exchange(private_key=AGENT_WALLET_PK, account_address=USER_ADDRESS, chain=chain)  # type: ignore
+            _EXC = exc
+            return _EXC
+    except Exception as e:
+        err = e
 
+    raise RuntimeError(f"Unable to construct Exchange client with provided SDK: {err}")
 
-# ========= Signal extraction =========
-def _extract_signal(sig: Any) -> Dict[str, Any]:
-    def g(name: str, *alts: str, default: Any = None) -> Any:
-        names = (name,) + alts
-        for n in names:
-            if hasattr(sig, n):
-                return getattr(sig, n)
-            if isinstance(sig, dict) and n in sig:
-                return sig[n]
-        return default
+# -------------------------
+# Helpers: price & decimals
+# -------------------------
 
-    side = g("side")
-    symbol = g("symbol") or g("pair") or g("market")
-    band_low = g("band_low", "entry_low", "entry_band_low", "bandMin", default=None)
-    band_high = g("band_high", "entry_high", "entry_band_high", "bandMax", default=None)
-    if band_low is None or band_high is None:
-        band = g("band", "entry_band", default=None)
-        if band and isinstance(band, (tuple, list)) and len(band) == 2:
-            band_low, band_high = band
-    stop_loss = g("stop_loss", "sl", "SL", default=None)
-    lev = g("lev", "leverage", default=None)
-    uid = g("uid", "message_uid", "id", default=None)
+def _get_asset_index(coin: str) -> int:
+    """Resolve asset index for a perp coin symbol via Info."""
+    info = _get_info()
+    # SDK method name_to_asset(symbol) exists per your logs
+    a = info.name_to_asset(coin)
+    if a is None:
+        raise RuntimeError(f"Unknown coin {coin}")
+    return int(a)
 
-    if side is None or symbol is None or band_low is None or band_high is None:
-        raise ValueError("Signal missing side/symbol/band_low/band_high.")
+def _get_mark_price(coin: str) -> Optional[float]:
+    """Try a few ways to grab a mark (or mid) price for a coin."""
+    info = _get_info()
 
-    return {
-        "side": str(side),
-        "symbol": str(symbol),
-        "band_low": float(band_low),
-        "band_high": float(band_high),
-        "stop_loss": float(stop_loss) if stop_loss is not None else None,
-        "lev": float(lev) if lev is not None else None,
-        "uid": str(uid) if uid is not None else None,
-    }
+    # 1) activeAssetCtx (preferred if available)
+    try:
+        if hasattr(info, "active_asset_ctx"):
+            ctx = info.active_asset_ctx(coin)  # may raise on older builds
+            if ctx and "ctx" in ctx and ctx["ctx"] and "markPx" in ctx["ctx"]:
+                return float(ctx["ctx"]["markPx"])
+    except Exception as e:
+        log.warning(f"active_asset_ctx failed for {coin}: {e}")
 
+    # 2) allMids
+    try:
+        if hasattr(info, "all_mids"):
+            mids = info.all_mids()
+            mid_s = mids.get(coin)
+            if mid_s is not None:
+                return float(mid_s)
+    except Exception as e:
+        log.warning(f"all_mids failed for {coin}: {e}")
 
-# ========= Order placement (adapts to SDK) =========
-# --- paste over your existing _place_order_real in broker/hyperliquid.py ---
+    # 3) l2Book mid
+    try:
+        if hasattr(info, "l2_book"):
+            book = info.l2_book(coin, nSigFigs=5, mantissa=None)
+            if isinstance(book, dict) and "levels" in book:
+                bids, asks = book["levels"]
+                if bids and asks:
+                    bid = float(bids[0]["px"])
+                    ask = float(asks[0]["px"])
+                    return (bid + ask) / 2.0
+    except Exception as e:
+        log.warning(f"l2_book mid failed for {coin}: {e}")
+
+    return None
+
+# --------------------------
+# OrderType / TimeInForce
+# --------------------------
+
+def _mk_order_type(tif: str = "Gtc"):
+    """
+    Returns an SDK OrderType object for a limit order with the given TIF.
+    Falls back to the dict shape if SDK types are not available.
+    """
+    tif_norm = (tif or "Gtc").strip().lower()
+    tif_norm = {"gtc": "Gtc", "ioc": "Ioc", "alo": "Alo"}.get(tif_norm, "Gtc")
+
+    try:
+        from hyperliquid.utils.signing import OrderType, TimeInForce  # type: ignore
+        tif_enum = getattr(TimeInForce, tif_norm)
+        return OrderType.Limit(tif_enum)
+    except Exception:
+        # Dict fallback (useful for dict-based endpoints; won’t be used in positional call)
+        return {"limit": {"tif": tif_norm}}
+
+# --------------------------
+# PUBLIC: submit API
+# --------------------------
+
+def _pick_entry_price(is_buy: bool, band_low: float, band_high: float) -> float:
+    # Simple policy: buy at lower band edge, sell at upper band edge
+    return band_low if is_buy else band_high
+
+def _normalize_symbol(raw: str) -> Tuple[str, str]:
+    """From 'ZRO/USD' -> ('ZRO', 'ZRO/USD')"""
+    sym = raw.strip().upper().replace("USDT", "USD").replace("PERP", "").replace("-PERP", "")
+    coin = sym.split("/")[0].strip()
+    return coin, sym
+
+def _round_sz_to_decimals(coin: str, sz: float) -> float:
+    """Round size to the asset's szDecimals if available; otherwise return as-is."""
+    try:
+        info = _get_info()
+        meta = getattr(info, "meta") if hasattr(info, "meta") else None
+        if callable(meta):
+            meta = meta()
+        if meta and "universe" in meta:
+            # meta['universe'] is list of assets; each has 'szDecimals'
+            for a in meta["universe"]:
+                if a.get("name") == coin and "szDecimals" in a:
+                    d = int(a["szDecimals"])
+                    factor = 10 ** d
+                    return math.floor(sz * factor + 1e-9) / factor
+    except Exception:
+        pass
+    return sz
 
 def _place_order_real(
     *,
     coin: str,
-    asset_idx: int | None = None,
-    asset: int | None = None,
+    asset_idx: int | None = None,   # kept for compatibility, unused in positional SDK call
+    asset: int | None = None,       # kept for compatibility, unused in positional SDK call
     side: str | None = None,
     is_buy: bool | None = None,
     px: str | None = None,
@@ -207,20 +259,32 @@ def _place_order_real(
     sz_str: str | None = None,
     size_str: str | None = None,
     tif: str = "Gtc",
-    reduce_only: bool,
+    reduce_only: bool = False,
+    cloid: str | None = None,
 ) -> Dict[str, Any]:
-    import inspect
+    """
+    Places a LIMIT order using the SDK's positional signature discovered in logs:
 
-    a = asset_idx if asset_idx is not None else asset
-    if a is None:
-        raise ValueError("asset index is required")
+      ex.order(
+        name: str,
+        is_buy: bool,
+        sz: float,
+        limit_px: float,
+        order_type: OrderType,
+        reduce_only: bool = False,
+        cloid: Optional[Cloid] = None,
+        builder: Optional[BuilderInfo] = None
+      )
+    """
+    ex = _get_exchange()
 
+    # Decide side
     if is_buy is None:
-        if side is None:
+        if not side:
             raise ValueError("either `side` or `is_buy` must be provided")
-        side_u = side.upper()
-        is_buy = side_u in ("BUY", "LONG")
+        is_buy = side.strip().upper() in ("BUY", "LONG")
 
+    # Choose strings first, then coerce to floats
     px_val = px_str if px_str is not None else px
     sz_val = sz_str if sz_str is not None else (size_str if size_str is not None else sz)
     if px_val is None or sz_val is None:
@@ -228,192 +292,103 @@ def _place_order_real(
 
     px_s = str(px_val)
     sz_s = str(sz_val)
+
     try:
-        px_f = float(px_s)
-    except Exception:
-        px_f = None
-    try:
+        limit_px = float(px_s)
         sz_f = float(sz_s)
-    except Exception:
-        sz_f = None
-
-    nonce = int(time.time() * 1000)
-    order_type_dict = {"limit": {"tif": tif}}
-    ex = _get_exchange()
-
-    # ---- try dict-style APIs first ----
-    action = {
-        "type": "order",
-        "orders": [{
-            "a": a,
-            "b": bool(is_buy),
-            "p": px_s,
-            "s": sz_s,
-            "r": reduce_only,
-            "t": order_type_dict,
-        }],
-        "grouping": "na",
-    }
-    try:
-        resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
-        log.info(f"[BROKER] order response (new): {resp}")
-        if isinstance(resp, dict) and resp.get("status") == "ok":
-            return resp
-        raise RuntimeError(f"Order rejected by API: {resp}")
-    except TypeError:
-        pass
     except Exception as e:
-        log.warning(f"[WARN] new-style order failed: {e}")
+        raise ValueError(f"invalid numeric px/sz: px={px_s!r} sz={sz_s!r}; {e}")
 
+    order_type = _mk_order_type(tif)
+
+    if HYPER_DRY_RUN:
+        log.info(f"[DRYRUN] submit LIMIT {'BUY' if is_buy else 'SELL'} {coin} px={limit_px} sz={sz_f} tif={tif} reduceOnly={reduce_only}")
+        return {"status": "ok", "dryRun": True}
+
+    # Positional SDK call per your signature
     try:
-        payload = {"action": action, "nonce": nonce}
-        if VAULT_ADDRESS:
-            payload["vaultAddress"] = VAULT_ADDRESS
-        resp = ex.order(payload)
-        log.info(f"[BROKER] order response (legacy-dict): {resp}")
-        if isinstance(resp, dict) and resp.get("status") == "ok":
-            return resp
-        raise RuntimeError(f"Order rejected by API: {resp}")
-    except TypeError:
-        pass
-    except Exception as e:
-        log.warning(f"[WARN] legacy-dict order failed: {e}")
+        args = (coin, bool(is_buy), sz_f, limit_px, order_type)
+        kwargs: Dict[str, Any] = {"reduce_only": bool(reduce_only)}
+        if cloid:
+            kwargs["cloid"] = cloid
+        resp = ex.order(*args, **kwargs)  # type: ignore[misc]
+        log.info(f"[BROKER] order response (positional SDK): {resp}")
 
-    # ---- POSITIONAL: inspect signature then call accordingly ----
-    sig = None
+        if isinstance(resp, dict):
+            if resp.get("status") == "ok":
+                return resp
+            if resp.get("success") is True:
+                return {"status": "ok", "response": resp}
+            raise RuntimeError(f"Order rejected: {resp}")
+        if resp:
+            return {"status": "ok", "response": resp}
+
+        raise RuntimeError(f"Unexpected falsy response: {resp!r}")
+    except Exception as e:
+        raise RuntimeError(f"SDK order failed: {e}") from e
+
+def submit_signal(sig) -> Dict[str, Any]:
+    """
+    Bridge layer called by execution.py. Expects `sig` to expose:
+      - side ('LONG'/'SHORT' or 'BUY'/'SELL')
+      - symbol (e.g. 'ZRO/USD')
+      - band_low, band_high (floats)
+      - stop_loss (float) (optional but logged)
+      - leverage (float) (optional; we size purely by USD_PER_ORDER here)
+      - timeframe (str)
+    """
+    # 1) Normalize and filter symbol
+    coin, sym = _normalize_symbol(sig.symbol)
+    if ALLOWED_SET and sym.upper() not in ALLOWED_SET and coin.upper() not in ALLOWED_SET:
+        log.info(f"[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: {sym}")
+        return {"status": "skipped", "reason": "symbol not allowed", "symbol": sym}
+
+    # 2) Resolve asset index (for logging/consistency; not needed for positional call)
     try:
-        sig = inspect.signature(ex.order)
-        log.info(f"[SIG] Exchange.order signature: {sig}")
+        a = _get_asset_index(coin)
     except Exception as e:
-        log.warning(f"[WARN] could not inspect signature: {e}")
+        return {"status": "error", "reason": f"asset index lookup failed: {e}"}
 
-    # Candidates to try, in order. We’ll use floats if available, else strings.
-    IF = (bool(is_buy), sz_f if sz_f is not None else sz_s, px_f if px_f is not None else px_s)
+    # 3) Log received plan
+    tif = getattr(sig, "tif", DEFAULT_TIF)
+    log.info(
+        f"[BROKER] {sig.side} {sym} band=({sig.band_low:.6f},{sig.band_high:.6f}) "
+        f"{'SL=' + str(sig.stop_loss) if getattr(sig, 'stop_loss', None) else ''} "
+        f"lev={getattr(sig, 'leverage', None)} TIF={tif}"
+    )
 
-    attempts: list[tuple[str, tuple, dict]] = []
-
-    # Most common modern positional shape with kwargs:
-    #   order(is_buy, sz, limit_px, order_type, reduce_only=False, asset=None, cloid=None, tif=None)
-    attempts += [
-        ("pos+kw:dict", IF + (order_type_dict,), {"reduce_only": reduce_only, "asset": a, "tif": tif}),
-        ("pos+kw:dict-no-tif", IF + (order_type_dict,), {"reduce_only": reduce_only, "asset": a}),
-        ("pos6-dict", IF + (order_type_dict, reduce_only, a), {}),
-        ("pos4-dict", IF + (order_type_dict,), {}),
-    ]
-
-    # Some variants want order_type="limit" and tif separate.
-    attempts += [
-        ("pos+kw:limit+tif", IF + ("limit",), {"tif": tif, "reduce_only": reduce_only, "asset": a}),
-        ("pos5-limit+tif", IF + ("limit", tif), {}),
-        ("pos7-limit+tif", IF + ("limit", tif, reduce_only, a), {}),
-    ]
-
-    # Some expect tif as 4th arg (rare); try it too.
-    attempts += [
-        ("pos4-tif", IF + (tif,), {}),
-        ("pos6-tif", IF + (tif, reduce_only, a), {}),
-    ]
-
-    last_err: Optional[BaseException] = None
-    for label, pos, kwargs in attempts:
-        try:
-            resp = ex.order(*pos, **kwargs)  # type: ignore[misc]
-            log.info(f"[BROKER] order response ({label}): {resp}")
-            if isinstance(resp, dict):
-                if resp.get("status") == "ok":
-                    return resp
-                # some SDKs return {'success': True}
-                if resp.get("success") is True:
-                    return {"status": "ok", "response": resp, "via": label}
-                raise RuntimeError(f"Order rejected by API: {resp}")
-            # truthy non-dict → accept
-            if resp:
-                return {"status": "ok", "response": resp, "via": label}
-            # falsy non-dict → treat as failure
-            last_err = RuntimeError(f"Non-dict falsy response: {resp!r}")
-        except TypeError as e:
-            log.warning(f"[WARN] {label} signature failed: {e}")
-            last_err = e
-        except Exception as e:
-            log.warning(f("[WARN] {label} order failed: {e}"))
-            last_err = e
-
-    raise RuntimeError(f"All SDK order call styles failed. Last error: {last_err}")
-
-
-# ========= Public entry =========
-def submit_signal(sig: Any) -> Optional[Dict[str, Any]]:
-    s = _extract_signal(sig)
-    side = s["side"].upper()
-    symbol = s["symbol"].upper()
-    band_low = s["band_low"]
-    band_high = s["band_high"]
-    stop_loss = s["stop_loss"]
-    uid = s["uid"]
-
-    if uid and uid in _UID_SEEN:
-        log.info(f"[SKIP] duplicate uid={uid}")
-        return None
-    if uid:
-        _UID_SEEN.add(uid)
-
-    coin = _symbol_to_coin(symbol)
-
-    if ONLY_EXECUTE_SYMBOLS is not None and symbol not in ONLY_EXECUTE_SYMBOLS:
-        log.info(f"[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: {symbol}")
-        return None
-
-    asset = _coin_to_asset_idx(coin)
-
-    if side in ("BUY", "LONG"):
-        px_entry = float(band_low)
-        is_buy = True
-    else:
-        px_entry = float(band_high)
-        is_buy = False
-
-    mark = _get_mark_price(coin, fallback_px=px_entry)
-    if mark is None:
-        log.warning(f"[PRICE] mark fetch failed for {coin}; falling back to entry price for sizing")
-
-    sz_float = _compute_size_from_notional(NOTIONAL_USD, mark if mark is not None else px_entry)
-    if sz_float is None or sz_float <= 0:
-        raise RuntimeError("Could not compute size from mark price; aborting.")
-
-    px_entry_str = f"{px_entry:.8f}".rstrip("0").rstrip(".")
-    sz_str = f"{sz_float:.8f}".rstrip("0").rstrip(".")
-
-    log.info(f"[BROKER] {side} {symbol} band=({band_low:.6f},{band_high:.6f})"
-             f"{' SL=' + str(stop_loss) if stop_loss is not None else ''} lev={s.get('lev') if s.get('lev') else ''} TIF={TIF}")
-    log.info("Websocket connected")
+    # 4) Price discovery
+    mark = _get_mark_price(coin)
     if mark is not None:
-        log.info(f"[PRICE] {coin} mark={mark:.5f}")
+        log.info(f"[PRICE] {coin} mark={mark}")
+    else:
+        log.info(f"[PRICE] mark fetch failed for {coin}; sizing from entry px")
 
-    log.info(f"[PLAN] side={'BUY' if is_buy else 'SELL'} coin={coin} a={asset} px={px_entry_str} "
-             f"sz={sz_str} tif={TIF} reduceOnly=False")
+    # 5) Build order plan
+    side_u = sig.side.strip().upper()
+    is_buy = side_u in ("BUY", "LONG")
 
-    if DRY_RUN:
-        print(f"[DRYRUN] submit LIMIT {'BUY' if is_buy else 'SELL'} {coin} a={asset} px={px_entry_str} sz={sz_str} tif={TIF}")
-        return {
-            "status": "dryrun",
-            "plan": {
-                "asset": asset,
-                "coin": coin,
-                "isBuy": is_buy,
-                "px": px_entry_str,
-                "sz": sz_str,
-                "tif": TIF,
-                "reduceOnly": False,
-            },
-        }
+    entry_px = _pick_entry_price(is_buy, float(sig.band_low), float(sig.band_high))
+    px_str = f"{entry_px:.8f}".rstrip("0").rstrip(".")
+    # size by USD (simple)
+    use_px = mark if mark is not None else entry_px
+    raw_sz = max(1e-12, USD_PER_ORDER / max(1e-12, use_px))
+    raw_sz = _round_sz_to_decimals(coin, raw_sz)
 
+    log.info(
+        f"[PLAN] side={'BUY' if is_buy else 'SELL'} coin={coin} a={a} px={px_str} "
+        f"sz={raw_sz:g} tif={tif} reduceOnly=False"
+    )
+
+    # 6) Place order
     resp = _place_order_real(
         coin=coin,
-        asset_idx=asset,
-        is_buy=is_buy,
-        px_str=px_entry_str,
-        sz_str=sz_str,
-        tif=TIF,
+        asset_idx=a,
+        side="BUY" if is_buy else "SELL",
+        px_str=px_str,
+        sz_str=f"{raw_sz:g}",
+        tif=tif,
         reduce_only=False,
+        cloid=None,
     )
     return resp
