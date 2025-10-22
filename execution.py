@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import logging
 import traceback
+import hashlib
 from collections import deque
 from typing import Any, Optional, Tuple, List, Iterable, Iterator
 
@@ -214,49 +215,82 @@ class ExecSignal:
         return f"<ExecSignal {' '.join(parts)}>"
 
 # -----------------------------------------------------------------------------
-# Dedupe for Discord message IDs (prevents double-runs on the same signal)
+# Dedupe for message IDs (prevents double-runs on the same signal)
 # -----------------------------------------------------------------------------
-_SEEN_MSG_IDS = set()
-_SEEN_ORDER = deque(maxlen=500)  # keep a rolling window of recent ids
+_SEEN_IDS: set[str] = set()
+_SEEN_ORDER = deque(maxlen=800)  # rolling window
 
-def _get_msg_id(sig: Any) -> Optional[int]:
-    # attribute
+def _stringify_id(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, (int,)):
+        return str(val)
+    s = str(val).strip()
+    return s or None
+
+def _get_msg_id(sig: Any) -> Optional[str]:
+    # attribute first
     for name in ("msg_id", "message_id", "id"):
         try:
             if hasattr(sig, name):
-                val = getattr(sig, name)
-                if isinstance(val, int):
-                    return val
-                if isinstance(val, str) and (val.isdigit() or (val.startswith("-") and val[1:].isdigit())):
-                    return int(val)
+                v = getattr(sig, name)
+                s = _stringify_id(v)
+                if s:
+                    return s
         except Exception:
             pass
     # mapping style
     if isinstance(sig, dict) or hasattr(sig, "get"):
         for name in ("msg_id", "message_id", "id"):
             try:
-                val = sig.get(name)  # type: ignore[attr-defined]
-                if val is None:
-                    continue
-                if isinstance(val, int):
-                    return val
-                if isinstance(val, str) and (val.isdigit() or (val.startswith("-") and val[1:].isdigit())):
-                    return int(val)
+                v = sig.get(name)  # type: ignore[attr-defined]
+                s = _stringify_id(v)
+                if s:
+                    return s
             except Exception:
                 pass
     return None
 
-def _already_processed(msg_id: Optional[int]) -> bool:
-    if msg_id is None:
-        return False
-    if msg_id in _SEEN_MSG_IDS:
-        print(f"[SKIP] duplicate message id={msg_id}")
+def _fingerprint(sig: Any) -> str:
+    """
+    Deterministic content fingerprint used when no message id is available.
+    Prefer a raw message/content field if present; else repr of canonical map if available.
+    """
+    raw = None
+    for k in ("raw_text", "content", "message_text"):
+        if hasattr(sig, k):
+            try:
+                vv = getattr(sig, k)
+                if vv:
+                    raw = str(vv)
+                    break
+            except Exception:
+                pass
+        if isinstance(sig, dict) and sig.get(k):
+            raw = str(sig[k])
+            break
+
+    if raw is None:
+        try:
+            # If ExecSignal, use its mapping; else use repr(sig)
+            if hasattr(sig, "items"):
+                raw = repr(sorted(list(sig.items())))  # type: ignore[attr-defined]
+            else:
+                raw = repr(sig)
+        except Exception:
+            raw = str(sig)
+
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+def _already_processed(uid: str) -> bool:
+    if uid in _SEEN_IDS:
+        print(f"[SKIP] duplicate uid={uid}")
         return True
-    _SEEN_MSG_IDS.add(msg_id)
-    _SEEN_ORDER.append(msg_id)
-    if len(_SEEN_MSG_IDS) > _SEEN_ORDER.maxlen:
+    _SEEN_IDS.add(uid)
+    _SEEN_ORDER.append(uid)
+    if len(_SEEN_IDS) > _SEEN_ORDER.maxlen:
         old = _SEEN_ORDER.popleft()
-        _SEEN_MSG_IDS.discard(old)
+        _SEEN_IDS.discard(old)
     return False
 
 # -----------------------------------------------------------------------------
@@ -333,8 +367,8 @@ def _summarize(sig: Any) -> str:
 # Public entry point
 # -----------------------------------------------------------------------------
 def execute_signal(sig: Any) -> None:
-    msg_id = _get_msg_id(sig)
-    if _already_processed(msg_id):
+    uid = _get_msg_id(sig) or _fingerprint(sig)
+    if _already_processed(uid):
         return
 
     summary = _summarize(sig)
