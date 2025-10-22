@@ -337,13 +337,20 @@ def _place_order_real(
     px: str | None = None,
     px_str: str | None = None,
     sz: str | None = None,
+    sz_str: str | None = None,
     size_str: str | None = None,
     tif: str,
     reduce_only: bool,
 ) -> dict:
     """
     Place a real order via the HL SDK.
-    Accepts either asset_idx/asset, side/is_buy, px/px_str, sz/size_str.
+
+    Accepts either:
+      - asset_idx or asset
+      - side ("BUY"/"SELL"/"LONG"/"SHORT") or is_buy (bool)
+      - px or px_str
+      - sz or sz_str or size_str
+
     Works with both newer and legacy SDK .order(..) signatures.
     """
     # --- normalize asset ---
@@ -360,26 +367,30 @@ def _place_order_real(
 
     # --- normalize px / sz ---
     px_val = px_str if px_str is not None else px
-    sz_val = size_str if size_str is not None else sz
+    sz_val = sz_str if sz_str is not None else (size_str if size_str is not None else sz)
     if px_val is None or sz_val is None:
-        raise ValueError("both price and size are required (px/px_str, sz/size_str)")
+        raise ValueError("both price and size are required (px/px_str, sz/sz_str/size_str)")
+
+    # strings for SDK
+    px_val = str(px_val)
+    sz_val = str(sz_val)
 
     nonce = int(time.time() * 1000)
 
     action = {
         "type": "order",
         "orders": [{
-            "a": a,
-            "b": bool(is_buy),
-            "p": str(px_val),
-            "s": str(sz_val),
-            "r": reduce_only,
+            "a": a,                    # asset index
+            "b": bool(is_buy),         # isBuy
+            "p": px_val,               # price (string)
+            "s": sz_val,               # size  (string)
+            "r": reduce_only,          # reduceOnly
             "t": {"limit": {"tif": tif}},
         }],
         "grouping": "na",
     }
 
-    # Try newer SDK signature first; fallback to legacy payload dict
+    # Try newer SDK signature first; fall back to legacy payload dict (0.20.x)
     try:
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
     except TypeError:
