@@ -1,92 +1,87 @@
 # broker/hyperliquid.py
-# Drop-in Hyperliquid broker for your VIP Signals worker.
-# - Uses Hyperliquid official Python SDK when available.
-# - Caches meta, resolves asset indices, handles size/price quantization.
-# - Places entry + TP/SL with grouping, updates leverage when provided.
-# - Graceful DRY_RUN and detailed error messages.
-
 from __future__ import annotations
 
 import os
 import time
 import math
 import logging
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
 import requests
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
 
-# --- Environment -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
 
 BASE_URL = os.getenv("HYPERLIQUID_BASE", "https://api.hyperliquid.xyz").rstrip("/")
-NETWORK = os.getenv("HYPER_NETWORK", "mainnet").lower()  # "mainnet" or "testnet"
+NETWORK = os.getenv("HYPER_NETWORK", "mainnet").lower()
 CHAIN_NAME = "Mainnet" if NETWORK == "mainnet" else "Testnet"
 
-# If you use HL API wallets (recommended), you can sign with a private key.
-# These two are what your screenshots show you already have:
 EVM_PRIVKEY = os.getenv("HYPER_EVM_PRIVKEY", "").strip()
 EVM_CHAIN_ID = int(os.getenv("HYPER_EVM_CHAIN_ID", "999" if NETWORK == "mainnet" else "998"))
 
-# Optional “API key/secret” placeholders – HL doesn’t use CEX-style HMAC keys.
-# We keep them only because your env has them; they’re not used for signing.
-HL_API_KEY = os.getenv("HYPER_API_KEY", "").strip()
-HL_API_SECRET = os.getenv("HYPER_API_SECRET", "").strip()
-
-# App-level controls you already set
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-ACCOUNT_MODE = os.getenv("ACCOUNT_MODE", "perp")  # "perp" | "spot" (we assume perp)
-EXECUTION_MODE = os.getenv("XECUTION_MODE", "OTO").upper()  # OTO means entry with TP/SL
-TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "20"))  # notional in USD
-FIXED_QTY = os.getenv("HYPER_FIXED_QTY")  # override qty in base if provided
+ACCOUNT_MODE = os.getenv("ACCOUNT_MODE", "perp")
+EXECUTION_MODE = os.getenv("XECUTION_MODE", "OTO").upper()
+TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "20"))
+FIXED_QTY = os.getenv("HYPER_FIXED_QTY")
 TP_WEIGHTS = [float(x) for x in os.getenv("TP_WEIGHTS", "0.10,0.15,0.15,0.20,0.20,0.20").split(",")]
-
 ONLY_EXECUTE = {s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()}
-
 ENTRY_TIMEOUT_MIN = int(os.getenv("ENTRY_TIMEOUT_MIN", "120"))
 POLL_OPEN_ORDERS_SEC = int(os.getenv("POLL_OPEN_ORDERS_SEC", "20"))
+VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip()
 
-# Subaccount/vault trading (optional)
-VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip()  # 0x... if you trade from a subaccount
-
-# -----------------------------------------------------------------------------
-# Optional: import the official HL SDK if present
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Optional: official SDK
+# ---------------------------------------------------------------------------
 
 SDK_AVAILABLE = True
 try:
-    # pip install hyperliquid-python-sdk
     from hyperliquid.info import Info
     from hyperliquid.exchange import Exchange
-    # Some sdk versions expose constants/helpers under utils
     try:
         from hyperliquid.utils import constants as HL_CONST
     except Exception:
         HL_CONST = None
 except Exception as e:
     SDK_AVAILABLE = False
-    LOG.warning("Hyperliquid Python SDK not available: %s", e)
+    LOG.warning("Hyperliquid SDK not available: %s", e)
 
-# -----------------------------------------------------------------------------
-# Simple signal model from your parser/execution layer
-# -----------------------------------------------------------------------------
+_SDK_INFO: Optional["Info"] = None
+_SDK_EX: Optional["Exchange"] = None
 
-@dataclass
-class ParsedSignal:
-    side: str              # "LONG" | "SHORT"
-    symbol: str            # "ETH/USD"
-    band_low: float        # entry band lo
-    band_high: float       # entry band hi
-    stop_loss: float       # SL price
-    tp_count: int          # number of take-profits requested
-    leverage: float        # requested leverage (e.g. 20)
-    timeframe: str         # "5m" etc.
 
-# -----------------------------------------------------------------------------
-# Asset/meta cache + helpers
-# -----------------------------------------------------------------------------
+def _sdk_info() -> "Info":
+    if not SDK_AVAILABLE:
+        raise RuntimeError("Hyperliquid SDK not installed. Install `hyperliquid-python-sdk`.")
+    global _SDK_INFO
+    if _SDK_INFO is None:
+        _SDK_INFO = Info(base_url=BASE_URL)
+    return _SDK_INFO
+
+
+def _sdk_exchange() -> "Exchange":
+    if not SDK_AVAILABLE:
+        raise RuntimeError("Hyperliquid SDK not installed. Install `hyperliquid-python-sdk`.")
+    if not EVM_PRIVKEY:
+        raise RuntimeError("HYPER_EVM_PRIVKEY not set. Needed to sign HL actions.")
+    global _SDK_EX
+    if _SDK_EX is None:
+        _SDK_EX = Exchange(
+            base_url=BASE_URL,
+            chain=CHAIN_NAME,
+            key=EVM_PRIVKEY,
+            vault_address=VAULT_ADDRESS or None,
+        )
+    return _SDK_EX
+
+# ---------------------------------------------------------------------------
+# Meta cache
+# ---------------------------------------------------------------------------
+
 
 class MetaCache:
     def __init__(self):
@@ -96,19 +91,19 @@ class MetaCache:
         self._last_refresh = 0
 
     def ensure(self):
-        if SDK_AVAILABLE:
-            now = time.time()
-            if self._meta is None or now - self._last_refresh > 300:
-                info = _sdk_info()
-                self._meta = info.meta()
-                self._last_refresh = now
-                # Build quick maps for perps
-                universe = self._meta.get("universe", [])  # perps
-                for idx, entry in enumerate(universe):
-                    coin = entry.get("name") or entry.get("spotName") or ""
-                    if coin:
-                        self._asset_index[coin.upper()] = idx
-                        self._sz_decimals[coin.upper()] = int(entry.get("szDecimals", 0))
+        if not SDK_AVAILABLE:
+            return
+        now = time.time()
+        if self._meta is None or now - self._last_refresh > 300:
+            info = _sdk_info()
+            self._meta = info.meta()
+            self._last_refresh = now
+            universe = self._meta.get("universe", [])
+            for idx, entry in enumerate(universe):
+                coin = (entry.get("name") or entry.get("spotName") or "").upper()
+                if coin:
+                    self._asset_index[coin] = idx
+                    self._sz_decimals[coin] = int(entry.get("szDecimals", 0))
 
     def asset_index(self, coin: str) -> int:
         coin = coin.upper()
@@ -124,51 +119,28 @@ class MetaCache:
             self.ensure()
             if coin in self._sz_decimals:
                 return self._sz_decimals[coin]
-        # Fallback conservative default
         return 3
 
 
 META = MetaCache()
 
-# -----------------------------------------------------------------------------
-# Price/size quantization to match HL rules
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def quantize_size(coin: str, sz: float) -> str:
-    sd = META.sz_decimals(coin)
-    q = round(sz, sd)
-    fmt = f"{{:.{sd}f}}"
-    return fmt.format(q)
 
-def quantize_price(coin: str, px: float, is_perp: bool = True) -> str:
-    # HL: <= 5 significant figures; and no more than (6 - szDecimals) decimals for perps
-    sd = META.sz_decimals(coin)
-    max_decimals = (6 if is_perp else 8) - sd
-    max_decimals = max(max_decimals, 0)
-    q = round(px, max_decimals)
-    fmt = f"{{:.{max_decimals}f}}"
-    out = fmt.format(q)
-    # ensure no excess sig figs for non-integers
-    if "." in out:
-        digits = out.replace(".", "").lstrip("0")
-        if len(digits) > 5 and max_decimals > 0:
-            # reduce decimals to respect 5 significant figures
-            cut = max(0, max_decimals - (len(digits) - 5))
-            q = round(px, cut)
-            out = f"{q:.{cut}f}"
-    return out
+def _symbol_to_coin(symbol: str) -> str:
+    s = symbol.upper().strip()
+    return s.split("/")[0] if "/" in s else s
 
-# -----------------------------------------------------------------------------
-# Mark price resolver
-# -----------------------------------------------------------------------------
 
 def _get_mark_price(coin: str) -> float:
     coin = coin.upper()
+    # Preferred: SDK info endpoints
     if SDK_AVAILABLE:
         info = _sdk_info()
         try:
             d = info.active_asset_ctx(coin)
-            # For perps, ctx contains markPx
             ctx = d.get("ctx", {})
             mark = float(ctx.get("markPx"))
             if mark > 0:
@@ -182,7 +154,7 @@ def _get_mark_price(coin: str) -> float:
                 return mid
         except Exception as e:
             LOG.warning("all_mids failed for %s: %s", coin, e)
-    # Final fallback: l2book via HTTP info
+    # Fallback: HTTP l2Book midpoint
     try:
         r = requests.post(
             f"{BASE_URL}/info",
@@ -198,156 +170,199 @@ def _get_mark_price(coin: str) -> float:
             best_ask = float(asks[0]["px"])
             return (best_bid + best_ask) / 2.0
     except Exception as e:
-        LOG.error("HTTP l2Book mark price fallback failed for %s: %s", coin, e)
+        LOG.error("HTTP l2Book fallback failed for %s: %s", coin, e)
     raise RuntimeError("Could not compute size from mark price; aborting.")
 
-# -----------------------------------------------------------------------------
-# SDK bootstrap
-# -----------------------------------------------------------------------------
 
-_SDK_INFO: Optional[Info] = None
-_SDK_EX: Optional[Exchange] = None
+def quantize_size(coin: str, sz: float) -> str:
+    sd = META.sz_decimals(coin)
+    q = round(sz, sd)
+    return f"{q:.{sd}f}"
 
-def _sdk_info() -> Info:
-    global _SDK_INFO
-    if _SDK_INFO is None:
-        if not SDK_AVAILABLE:
-            raise RuntimeError("Hyperliquid SDK not installed. Install `hyperliquid-python-sdk`.")
-        _SDK_INFO = Info(base_url=BASE_URL)
-    return _SDK_INFO
 
-def _sdk_exchange() -> Exchange:
-    global _SDK_EX
-    if _SDK_EX is None:
-        if not SDK_AVAILABLE:
-            raise RuntimeError("Hyperliquid SDK not installed. Install `hyperliquid-python-sdk`.")
-        if not EVM_PRIVKEY:
-            raise RuntimeError("HYPER_EVM_PRIVKEY not set. Needed to sign HL actions.")
-        # Exchange signer based on EVM private key; pass chain and vault if any
-        _SDK_EX = Exchange(
-            base_url=BASE_URL,
-            chain=CHAIN_NAME,      # "Mainnet" or "Testnet"
-            account=None,          # let SDK derive from privkey
-            key=EVM_PRIVKEY,       # private key string "0x..."
-            vault_address=VAULT_ADDRESS or None,
-        )
-    return _SDK_EX
+def quantize_price(coin: str, px: float, is_perp: bool = True) -> str:
+    sd = META.sz_decimals(coin)
+    max_decimals = (6 if is_perp else 8) - sd
+    max_decimals = max(max_decimals, 0)
+    q = round(px, max_decimals)
+    out = f"{q:.{max_decimals}f}"
+    if "." in out:
+        digits = out.replace(".", "").lstrip("0")
+        if len(digits) > 5 and max_decimals > 0:
+            cut = max(0, max_decimals - (len(digits) - 5))
+            q = round(px, cut)
+            out = f"{q:.{cut}f}"
+    return out
 
-# -----------------------------------------------------------------------------
-# Public entry-point used by execution.py
-# -----------------------------------------------------------------------------
 
-def submit_signal(sig: ParsedSignal) -> None:
+def _read(sig: Any, *names, default=None):
+    """Read multiple possible attribute or dict-key names from `sig`."""
+    for n in names:
+        if hasattr(sig, n):
+            return getattr(sig, n)
+        if isinstance(sig, dict) and n in sig:
+            return sig[n]
+    return default
+
+
+def _extract_signal(sig: Any) -> Dict[str, Any]:
+    """Accept ExecSignal, dict, or similar—and normalize to a dict we can use."""
+    side = (_read(sig, "side") or _read(sig, "direction") or "").upper()
+    symbol = _read(sig, "symbol", "ticker", "pair") or ""
+    # Band lows/highs: accept many variants
+    band_low = _read(sig, "band_low", "band_lo", "entry_low", "lo", "low")
+    band_high = _read(sig, "band_high", "band_hi", "entry_high", "hi", "high")
+    # Some parsers store band as a tuple
+    if (band_low is None or band_high is None) and hasattr(sig, "band"):
+        try:
+            lo, hi = getattr(sig, "band")
+            if band_low is None:
+                band_low = lo
+            if band_high is None:
+                band_high = hi
+        except Exception:
+            pass
+    if (band_low is None or band_high is None) and isinstance(sig, dict) and "band" in sig:
+        try:
+            lo, hi = sig["band"]
+            if band_low is None:
+                band_low = lo
+            if band_high is None:
+                band_high = hi
+        except Exception:
+            pass
+
+    stop_loss = _read(sig, "stop_loss", "sl", "stop", "stopPrice")
+    tp_count = _read(sig, "tp_count", "tpn", "tpN", "take_profit_count", default=1)
+    leverage = _read(sig, "leverage", "lev", "x", default=None)
+    timeframe = _read(sig, "timeframe", "tf", default="")
+
+    if not side or not symbol:
+        raise ValueError(f"Signal missing side/symbol: {sig}")
+
+    if band_low is None or band_high is None:
+        raise ValueError("Signal missing band_low/band_high (or equivalent fields).")
+
+    if stop_loss is None:
+        raise ValueError("Signal missing stop_loss/SL.")
+
+    try:
+        tp_count = int(tp_count)
+    except Exception:
+        tp_count = 1
+
+    try:
+        leverage = int(leverage) if leverage is not None else None
+    except Exception:
+        leverage = None
+
+    return dict(
+        side=side,
+        symbol=symbol,
+        band_low=float(band_low),
+        band_high=float(band_high),
+        stop_loss=float(stop_loss),
+        tp_count=tp_count,
+        leverage=leverage,
+        timeframe=str(timeframe),
+    )
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def submit_signal(sig: Any) -> None:
     """
-    Executes a signal into Hyperliquid.
-      - side: LONG/SHORT
-      - symbol: e.g., "ETH/USD"  -> coin "ETH"
-      - band_low/band_high: preferred entry band
-      - stop_loss: absolute price
-      - tp_count: number of TPs requested (we'll cap to len(TP_WEIGHTS))
-      - leverage: int/float
+    Entry called by execution.py
+    Accepts your ExecSignal (or dict) and routes to HL.
     """
-    # Filter by allow-list if set
+    s = _extract_signal(sig)
+
     if ONLY_EXECUTE:
-        if sig.symbol.upper() not in ONLY_EXECUTE and _symbol_to_coin(sig.symbol) not in ONLY_EXECUTE:
-            LOG.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", sig.symbol)
+        if s["symbol"].upper() not in ONLY_EXECUTE and _symbol_to_coin(s["symbol"]) not in ONLY_EXECUTE:
+            LOG.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", s["symbol"])
             return
 
-    coin = _symbol_to_coin(sig.symbol)
-    LOG.info("[BROKER] %s %s band=(%.6f,%.6f) SL=%.6f TPn=%d lev=%.1f TF=%s",
-             sig.side, sig.symbol, sig.band_low, sig.band_high, sig.stop_loss,
-             sig.tp_count, sig.leverage, sig.timeframe)
+    coin = _symbol_to_coin(s["symbol"])
 
-    # Compute size
-    size_str, px_entry_str, brackets = _build_order_plan(sig, coin)
+    LOG.info(
+        "[BROKER] %s %s band=(%.6f, %.6f) SL=%.6f TPn=%d lev=%s TF=%s",
+        s["side"],
+        s["symbol"],
+        s["band_low"],
+        s["band_high"],
+        s["stop_loss"],
+        s["tp_count"],
+        str(s["leverage"]) if s["leverage"] is not None else "—",
+        s["timeframe"],
+    )
 
-    # DRY RUN
+    size_str, px_entry_str, brackets = _build_order_plan(
+        side=s["side"], coin=coin,
+        band_low=s["band_low"], band_high=s["band_high"],
+        stop_loss=s["stop_loss"], tp_count=s["tp_count"]
+    )
+
     if DRY_RUN:
-        LOG.info("[DRY_RUN] Would place %s %s size=%s @ %s with %d TP(s) and SL=%s",
-                 sig.side, coin, size_str, px_entry_str, len(brackets["tps"]), brackets["sl"])
+        LOG.info(
+            "[DRY_RUN] Would place %s %s size=%s @ %s with %d TP(s) and SL=%s",
+            s["side"], coin, size_str, px_entry_str, len(brackets['tps']), brackets['sl']["px"]
+        )
         return
 
-    # Live
     payload = {
         "coin": coin,
         "asset": META.asset_index(coin),
-        "side": sig.side.upper(),
+        "side": s["side"],
         "px_entry": px_entry_str,
         "size": size_str,
-        "tp_list": brackets["tps"],  # list of {"px": str, "sz": str}
-        "sl": brackets["sl"],        # {"px": str}
-        "leverage": int(sig.leverage) if sig.leverage else None,
+        "tp_list": brackets["tps"],
+        "sl": brackets["sl"],
+        "leverage": s["leverage"],
         "grouping": "positionTpsl",
-        "tif": "Ioc",                # IOC entry by default
+        "tif": "Ioc",
     }
     _place_order_real(payload)
 
-# -----------------------------------------------------------------------------
-# Planning helpers
-# -----------------------------------------------------------------------------
 
-def _symbol_to_coin(symbol: str) -> str:
-    # "ETH/USD" -> "ETH"
-    s = symbol.upper().strip()
-    if "/" in s:
-        return s.split("/")[0]
-    return s
-
-def _build_order_plan(sig: ParsedSignal, coin: str):
-    # Determine entry price (simple heuristic: for SHORT choose band_low; for LONG choose band_high)
-    if sig.side.upper() == "SHORT":
-        px_entry = sig.band_low
-    else:
-        px_entry = sig.band_high
+def _build_order_plan(*, side: str, coin: str, band_low: float, band_high: float, stop_loss: float, tp_count: int):
+    side_up = side.upper()
+    px_entry = band_low if side_up == "SHORT" else band_high
 
     mark = _get_mark_price(coin)
 
-    # Determine size
     if FIXED_QTY:
         base_qty = float(FIXED_QTY)
     else:
-        # sz = notional / mark
-        notional = max(TRADE_SIZE_USD, 10.0)  # respect HL min trade notional ($10)
+        notional = max(TRADE_SIZE_USD, 10.0)
         base_qty = notional / max(mark, 1e-9)
 
     size_str = quantize_size(coin, base_qty)
     px_entry_str = quantize_price(coin, px_entry, is_perp=True)
 
-    # Build TPs: spread weights across size
-    tp_n = max(1, min(sig.tp_count or 1, len(TP_WEIGHTS)))
+    tp_n = max(1, min(tp_count or 1, len(TP_WEIGHTS)))
     weights = TP_WEIGHTS[:tp_n]
-    # Normalize weights to 1.0 (safety)
     wsum = sum(weights)
     weights = [w / wsum for w in weights]
 
     tps: List[Dict[str, str]] = []
-    # simple 0.25% steps away from entry if band lacks explicit TPs
-    # you can replace with your own TP ladder logic
     step = 0.0025
     for i, w in enumerate(weights, start=1):
-        tp_px = px_entry * (1 - step * i) if sig.side.upper() == "SHORT" else px_entry * (1 + step * i)
+        tp_px = px_entry * (1 - step * i) if side_up == "SHORT" else px_entry * (1 + step * i)
         tp_px_str = quantize_price(coin, tp_px, is_perp=True)
         child_sz = float(size_str) * w
         child_sz_str = quantize_size(coin, child_sz)
         tps.append({"px": tp_px_str, "sz": child_sz_str})
 
-    sl_px_str = quantize_price(coin, float(sig.stop_loss), is_perp=True)
-
+    sl_px_str = quantize_price(coin, float(stop_loss), is_perp=True)
     return size_str, px_entry_str, {"tps": tps, "sl": {"px": sl_px_str}}
 
-# -----------------------------------------------------------------------------
-# Real placement
-# -----------------------------------------------------------------------------
 
 def _place_order_real(plan: Dict) -> None:
-    """Use HL SDK to submit:
-         - optional leverage update
-         - entry (IOC limit at provided px)
-         - attach TP/SL triggers with grouping=positionTpsl
-    """
     coin = plan["coin"]
     asset = plan["asset"]
-    is_buy = plan["side"] == "LONG"
+    is_buy = plan["side"].upper() == "LONG"
     px_entry = plan["px_entry"]
     size = plan["size"]
     tif = plan.get("tif", "Ioc")
@@ -359,12 +374,11 @@ def _place_order_real(plan: Dict) -> None:
     if not SDK_AVAILABLE:
         raise NotImplementedError(
             "Hyperliquid SDK is required for live placement. "
-            "Install `hyperliquid-python-sdk` and provide HYPER_EVM_PRIVKEY."
+            "Install `hyperliquid-python-sdk` and set HYPER_EVM_PRIVKEY."
         )
 
     ex = _sdk_exchange()
 
-    # 1) Update leverage if requested
     if leverage:
         try:
             ex.update_leverage(asset=asset, is_cross=True, leverage=int(leverage))
@@ -372,10 +386,7 @@ def _place_order_real(plan: Dict) -> None:
         except Exception as e:
             LOG.warning("[HL] update_leverage failed on %s: %s", coin, e)
 
-    # 2) Build orders
     orders = []
-
-    # Entry (limit IOC as default “marketable” intent)
     orders.append({
         "a": asset,
         "b": is_buy,
@@ -385,18 +396,16 @@ def _place_order_real(plan: Dict) -> None:
         "t": {"limit": {"tif": tif}},
     })
 
-    # Add TP triggers
     for tp in tps:
         orders.append({
             "a": asset,
-            "b": not is_buy,  # opposite side to close
-            "p": "0",         # ignored for trigger market=True
+            "b": not is_buy,
+            "p": "0",
             "s": tp["sz"],
-            "r": True,        # reduce-only
+            "r": True,
             "t": {"trigger": {"isMarket": True, "triggerPx": tp["px"], "tpsl": "tp"}},
         })
 
-    # Add SL trigger
     if sl:
         orders.append({
             "a": asset,
@@ -407,17 +416,14 @@ def _place_order_real(plan: Dict) -> None:
             "t": {"trigger": {"isMarket": True, "triggerPx": sl["px"], "tpsl": "sl"}},
         })
 
-    # 3) Send one batched action with grouping
     try:
         res = ex.place_orders(
             orders=orders,
-            grouping=grouping,       # "positionTpsl" recommended
+            grouping=grouping,
             vault_address=VAULT_ADDRESS or None,
-            # The SDK handles nonce/signature. If you need expiresAfter: pass expires_after_ms=...
         )
         LOG.info("[HL] order response: %s", str(res))
     except Exception as e:
-        # Try to decode common server errors if possible
         msg = str(e)
         if "MinTradeNtl" in msg:
             LOG.error("Rejected: below minimum $10 notional.")
@@ -430,24 +436,3 @@ def _place_order_real(plan: Dict) -> None:
         else:
             LOG.error("[HL] placement failed: %s", msg)
         raise
-
-# -----------------------------------------------------------------------------
-# Human-friendly execution entry for your logs
-# -----------------------------------------------------------------------------
-
-def preview_payload(sig: ParsedSignal) -> dict:
-    """Utility for logging/tests."""
-    coin = _symbol_to_coin(sig.symbol)
-    size_str, px_entry_str, brackets = _build_order_plan(sig, coin)
-    return {
-        "coin": coin,
-        "asset": META.asset_index(coin) if SDK_AVAILABLE else None,
-        "side": sig.side.upper(),
-        "px_entry": px_entry_str,
-        "size": size_str,
-        "leverage": sig.leverage,
-        "tp_list": brackets["tps"],
-        "sl": brackets["sl"],
-        "grouping": "positionTpsl",
-        "tif": "Ioc",
-    }
