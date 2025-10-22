@@ -3,18 +3,13 @@ from __future__ import annotations
 
 import os
 import time
-import math
 import logging
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 
 import requests
 
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
-
-# ---------------------------------------------------------------------------
-# Environment
-# ---------------------------------------------------------------------------
 
 BASE_URL = os.getenv("HYPERLIQUID_BASE", "https://api.hyperliquid.xyz").rstrip("/")
 NETWORK = os.getenv("HYPER_NETWORK", "mainnet").lower()
@@ -34,16 +29,13 @@ ENTRY_TIMEOUT_MIN = int(os.getenv("ENTRY_TIMEOUT_MIN", "120"))
 POLL_OPEN_ORDERS_SEC = int(os.getenv("POLL_OPEN_ORDERS_SEC", "20"))
 VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip()
 
-# ---------------------------------------------------------------------------
-# Optional: official SDK
-# ---------------------------------------------------------------------------
-
+# --- SDK (optional but recommended) ------------------------------------------
 SDK_AVAILABLE = True
 try:
     from hyperliquid.info import Info
     from hyperliquid.exchange import Exchange
     try:
-        from hyperliquid.utils import constants as HL_CONST
+        from hyperliquid.utils import constants as HL_CONST  # not required
     except Exception:
         HL_CONST = None
 except Exception as e:
@@ -78,9 +70,7 @@ def _sdk_exchange() -> "Exchange":
         )
     return _SDK_EX
 
-# ---------------------------------------------------------------------------
-# Meta cache
-# ---------------------------------------------------------------------------
+# --- Meta cache --------------------------------------------------------------
 
 
 class MetaCache:
@@ -99,6 +89,8 @@ class MetaCache:
             self._meta = info.meta()
             self._last_refresh = now
             universe = self._meta.get("universe", [])
+            self._asset_index.clear()
+            self._sz_decimals.clear()
             for idx, entry in enumerate(universe):
                 coin = (entry.get("name") or entry.get("spotName") or "").upper()
                 if coin:
@@ -124,9 +116,7 @@ class MetaCache:
 
 META = MetaCache()
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers -----------------------------------------------------------------
 
 
 def _symbol_to_coin(symbol: str) -> str:
@@ -136,7 +126,6 @@ def _symbol_to_coin(symbol: str) -> str:
 
 def _get_mark_price(coin: str) -> float:
     coin = coin.upper()
-    # Preferred: SDK info endpoints
     if SDK_AVAILABLE:
         info = _sdk_info()
         try:
@@ -196,7 +185,6 @@ def quantize_price(coin: str, px: float, is_perp: bool = True) -> str:
 
 
 def _read(sig: Any, *names, default=None):
-    """Read multiple possible attribute or dict-key names from `sig`."""
     for n in names:
         if hasattr(sig, n):
             return getattr(sig, n)
@@ -205,32 +193,65 @@ def _read(sig: Any, *names, default=None):
     return default
 
 
+def _maybe_tuple(v: Any) -> Optional[Tuple[float, float]]:
+    try:
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            lo, hi = v
+            return float(lo), float(hi)
+    except Exception:
+        pass
+    return None
+
+
 def _extract_signal(sig: Any) -> Dict[str, Any]:
-    """Accept ExecSignal, dict, or similar—and normalize to a dict we can use."""
-    side = (_read(sig, "side") or _read(sig, "direction") or "").upper()
+    side = (_read(sig, "side", "direction") or "").upper()
     symbol = _read(sig, "symbol", "ticker", "pair") or ""
-    # Band lows/highs: accept many variants
-    band_low = _read(sig, "band_low", "band_lo", "entry_low", "lo", "low")
-    band_high = _read(sig, "band_high", "band_hi", "entry_high", "hi", "high")
-    # Some parsers store band as a tuple
-    if (band_low is None or band_high is None) and hasattr(sig, "band"):
-        try:
-            lo, hi = getattr(sig, "band")
-            if band_low is None:
-                band_low = lo
-            if band_high is None:
-                band_high = hi
-        except Exception:
-            pass
-    if (band_low is None or band_high is None) and isinstance(sig, dict) and "band" in sig:
-        try:
-            lo, hi = sig["band"]
-            if band_low is None:
-                band_low = lo
-            if band_high is None:
-                band_high = hi
-        except Exception:
-            pass
+
+    # Try a broad set of alias names for band low/high:
+    low_aliases = (
+        "band_low", "band_lo", "band_min",
+        "entry_low", "entry_min",
+        "low", "lo", "min", "lower",
+        "entry_band_low", "entry_band_lo", "entry_band_min",
+    )
+    high_aliases = (
+        "band_high", "band_hi", "band_max",
+        "entry_high", "entry_max",
+        "high", "hi", "max", "upper",
+        "entry_band_high", "entry_band_hi", "entry_band_max",
+    )
+
+    band_low = _read(sig, *low_aliases)
+    band_high = _read(sig, *high_aliases)
+
+    # If still missing, auto-detect any tuple/list band field.
+    if band_low is None or band_high is None:
+        # Common tuple field names:
+        tuple_names = ("band", "entry_band", "entry", "range", "price_band", "entry_range")
+        for name in tuple_names:
+            v = _read(sig, name)
+            pair = _maybe_tuple(v)
+            if pair:
+                band_low, band_high = pair
+                break
+        # If still none, scan any attribute/dict key that contains 'band' or 'entry'
+        if (band_low is None or band_high is None) and not isinstance(sig, dict):
+            try:
+                for k, v in vars(sig).items():
+                    if isinstance(k, str) and any(s in k.lower() for s in ("band", "entry")):
+                        pair = _maybe_tuple(v)
+                        if pair:
+                            band_low, band_high = pair
+                            break
+            except Exception:
+                pass
+        if (band_low is None or band_high is None) and isinstance(sig, dict):
+            for k, v in sig.items():
+                if isinstance(k, str) and any(s in k.lower() for s in ("band", "entry")):
+                    pair = _maybe_tuple(v)
+                    if pair:
+                        band_low, band_high = pair
+                        break
 
     stop_loss = _read(sig, "stop_loss", "sl", "stop", "stopPrice")
     tp_count = _read(sig, "tp_count", "tpn", "tpN", "take_profit_count", default=1)
@@ -241,7 +262,8 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
         raise ValueError(f"Signal missing side/symbol: {sig}")
 
     if band_low is None or band_high is None:
-        raise ValueError("Signal missing band_low/band_high (or equivalent fields).")
+        tried = ", ".join(low_aliases) + " / " + ", ".join(high_aliases)
+        raise ValueError(f"Signal missing band_low/band_high. Tried aliases: {tried}")
 
     if stop_loss is None:
         raise ValueError("Signal missing stop_loss/SL.")
@@ -258,7 +280,7 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
 
     return dict(
         side=side,
-        symbol=symbol,
+        symbol=str(symbol),
         band_low=float(band_low),
         band_high=float(band_high),
         stop_loss=float(stop_loss),
@@ -267,16 +289,10 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
         timeframe=str(timeframe),
     )
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+# --- Public API --------------------------------------------------------------
 
 
 def submit_signal(sig: Any) -> None:
-    """
-    Entry called by execution.py
-    Accepts your ExecSignal (or dict) and routes to HL.
-    """
     s = _extract_signal(sig)
 
     if ONLY_EXECUTE:
@@ -288,14 +304,8 @@ def submit_signal(sig: Any) -> None:
 
     LOG.info(
         "[BROKER] %s %s band=(%.6f, %.6f) SL=%.6f TPn=%d lev=%s TF=%s",
-        s["side"],
-        s["symbol"],
-        s["band_low"],
-        s["band_high"],
-        s["stop_loss"],
-        s["tp_count"],
-        str(s["leverage"]) if s["leverage"] is not None else "—",
-        s["timeframe"],
+        s["side"], s["symbol"], s["band_low"], s["band_high"], s["stop_loss"],
+        s["tp_count"], str(s["leverage"]) if s["leverage"] is not None else "—", s["timeframe"]
     )
 
     size_str, px_entry_str, brackets = _build_order_plan(
