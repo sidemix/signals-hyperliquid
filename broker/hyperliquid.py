@@ -192,6 +192,8 @@ def _extract_signal(sig: Any) -> Dict[str, Any]:
 
 
 # ========= Order placement (adapts to SDK) =========
+# --- paste over your existing _place_order_real in broker/hyperliquid.py ---
+
 def _place_order_real(
     *,
     coin: str,
@@ -207,22 +209,7 @@ def _place_order_real(
     tif: str = "Gtc",
     reduce_only: bool,
 ) -> Dict[str, Any]:
-    """
-    Tries multiple SDK signatures:
-
-    A) NEW dict style:
-         ex.order(action, nonce=..., vaultAddress=...)
-    B) LEGACY dict wrapper:
-         ex.order({"action":action, "nonce":...})
-    C) POSITIONAL families (we try several):
-         ex.order(is_buy, sz, limit_px, order_type, reduce_only, asset)
-         ex.order(is_buy, sz, limit_px, order_type)
-         ex.order(is_buy, sz, limit_px, "limit", tif, reduce_only, asset)
-         ex.order(is_buy, sz, limit_px, "limit", tif)
-         ex.order(is_buy, sz, limit_px, tif, reduce_only, asset)
-         ex.order(is_buy, sz, limit_px, tif)
-    with both float and str for px/sz.
-    """
+    import inspect
 
     a = asset_idx if asset_idx is not None else asset
     if a is None:
@@ -239,7 +226,6 @@ def _place_order_real(
     if px_val is None or sz_val is None:
         raise ValueError("both price and size are required (px/px_str, sz/sz_str/size_str)")
 
-    # normalize as str (dict-based) and float (positional-based)
     px_s = str(px_val)
     sz_s = str(sz_val)
     try:
@@ -252,10 +238,10 @@ def _place_order_real(
         sz_f = None
 
     nonce = int(time.time() * 1000)
-
     order_type_dict = {"limit": {"tif": tif}}
-    order_type_str = "limit"
+    ex = _get_exchange()
 
+    # ---- try dict-style APIs first ----
     action = {
         "type": "order",
         "orders": [{
@@ -268,10 +254,6 @@ def _place_order_real(
         }],
         "grouping": "na",
     }
-
-    ex = _get_exchange()
-
-    # A) New dict style
     try:
         resp = ex.order(action, nonce=nonce, vaultAddress=VAULT_ADDRESS or None)  # type: ignore[arg-type]
         log.info(f"[BROKER] order response (new): {resp}")
@@ -283,7 +265,6 @@ def _place_order_real(
     except Exception as e:
         log.warning(f"[WARN] new-style order failed: {e}")
 
-    # B) Legacy dict wrapper
     try:
         payload = {"action": action, "nonce": nonce}
         if VAULT_ADDRESS:
@@ -298,60 +279,63 @@ def _place_order_real(
     except Exception as e:
         log.warning(f"[WARN] legacy-dict order failed: {e}")
 
-    # C) Positional families (try a lot, noisy on purpose so we can see which wins)
-    attempts: List[Tuple[str, Tuple[Any, ...]]] = []
+    # ---- POSITIONAL: inspect signature then call accordingly ----
+    sig = None
+    try:
+        sig = inspect.signature(ex.order)
+        log.info(f"[SIG] Exchange.order signature: {sig}")
+    except Exception as e:
+        log.warning(f"[WARN] could not inspect signature: {e}")
 
-    # With dict order_type, prefer floats when available
-    if sz_f is not None and px_f is not None:
-        attempts += [
-            ("pos-6-float", (bool(is_buy), sz_f, px_f, order_type_dict, reduce_only, a)),
-            ("pos-4-float", (bool(is_buy), sz_f, px_f, order_type_dict)),
-        ]
-    # With dict order_type, strings
+    # Candidates to try, in order. We’ll use floats if available, else strings.
+    IF = (bool(is_buy), sz_f if sz_f is not None else sz_s, px_f if px_f is not None else px_s)
+
+    attempts: list[tuple[str, tuple, dict]] = []
+
+    # Most common modern positional shape with kwargs:
+    #   order(is_buy, sz, limit_px, order_type, reduce_only=False, asset=None, cloid=None, tif=None)
     attempts += [
-        ("pos-6-str", (bool(is_buy), sz_s, px_s, order_type_dict, reduce_only, a)),
-        ("pos-4-str", (bool(is_buy), sz_s, px_s, order_type_dict)),
+        ("pos+kw:dict", IF + (order_type_dict,), {"reduce_only": reduce_only, "asset": a, "tif": tif}),
+        ("pos+kw:dict-no-tif", IF + (order_type_dict,), {"reduce_only": reduce_only, "asset": a}),
+        ("pos6-dict", IF + (order_type_dict, reduce_only, a), {}),
+        ("pos4-dict", IF + (order_type_dict,), {}),
     ]
 
-    # With string "limit" + separate tif
-    if sz_f is not None and px_f is not None:
-        attempts += [
-            ("pos-limit-tif-7-float", (bool(is_buy), sz_f, px_f, order_type_str, tif, reduce_only, a)),
-            ("pos-limit-tif-5-float", (bool(is_buy), sz_f, px_f, order_type_str, tif)),
-        ]
+    # Some variants want order_type="limit" and tif separate.
     attempts += [
-        ("pos-limit-tif-7-str", (bool(is_buy), sz_s, px_s, order_type_str, tif, reduce_only, a)),
-        ("pos-limit-tif-5-str", (bool(is_buy), sz_s, px_s, order_type_str, tif)),
+        ("pos+kw:limit+tif", IF + ("limit",), {"tif": tif, "reduce_only": reduce_only, "asset": a}),
+        ("pos5-limit+tif", IF + ("limit", tif), {}),
+        ("pos7-limit+tif", IF + ("limit", tif, reduce_only, a), {}),
     ]
 
-    # With bare tif (some variants use tif as 4th arg)
-    if sz_f is not None and px_f is not None:
-        attempts += [
-            ("pos-tif-6-float", (bool(is_buy), sz_f, px_f, tif, reduce_only, a)),
-            ("pos-tif-4-float", (bool(is_buy), sz_f, px_f, tif)),
-        ]
+    # Some expect tif as 4th arg (rare); try it too.
     attempts += [
-        ("pos-tif-6-str", (bool(is_buy), sz_s, px_s, tif, reduce_only, a)),
-        ("pos-tif-4-str", (bool(is_buy), sz_s, px_s, tif)),
+        ("pos4-tif", IF + (tif,), {}),
+        ("pos6-tif", IF + (tif, reduce_only, a), {}),
     ]
 
-    last_err: Optional[Exception] = None
-    for label, args in attempts:
+    last_err: Optional[BaseException] = None
+    for label, pos, kwargs in attempts:
         try:
-            resp = ex.order(*args)  # type: ignore[misc]
+            resp = ex.order(*pos, **kwargs)  # type: ignore[misc]
             log.info(f"[BROKER] order response ({label}): {resp}")
-            # If dict-like, check status
             if isinstance(resp, dict):
                 if resp.get("status") == "ok":
                     return resp
+                # some SDKs return {'success': True}
+                if resp.get("success") is True:
+                    return {"status": "ok", "response": resp, "via": label}
                 raise RuntimeError(f"Order rejected by API: {resp}")
-            # Non-dict truthy → consider success
-            return {"status": "ok", "response": resp, "via": label}
+            # truthy non-dict → accept
+            if resp:
+                return {"status": "ok", "response": resp, "via": label}
+            # falsy non-dict → treat as failure
+            last_err = RuntimeError(f"Non-dict falsy response: {resp!r}")
         except TypeError as e:
             log.warning(f"[WARN] {label} signature failed: {e}")
             last_err = e
         except Exception as e:
-            log.warning(f"[WARN] {label} order failed: {e}")
+            log.warning(f("[WARN] {label} order failed: {e}"))
             last_err = e
 
     raise RuntimeError(f"All SDK order call styles failed. Last error: {last_err}")
