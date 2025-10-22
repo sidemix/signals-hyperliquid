@@ -20,14 +20,10 @@ EVM_PRIVKEY = os.getenv("HYPER_EVM_PRIVKEY", "").strip()
 EVM_CHAIN_ID = int(os.getenv("HYPER_EVM_CHAIN_ID", "999" if NETWORK == "mainnet" else "998"))
 
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-ACCOUNT_MODE = os.getenv("ACCOUNT_MODE", "perp")
-EXECUTION_MODE = os.getenv("XECUTION_MODE", "OTO").upper()
 TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "20"))
 FIXED_QTY = os.getenv("HYPER_FIXED_QTY")
 TP_WEIGHTS = [float(x) for x in os.getenv("TP_WEIGHTS", "0.10,0.15,0.15,0.20,0.20,0.20").split(",")]
 ONLY_EXECUTE = {s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()}
-ENTRY_TIMEOUT_MIN = int(os.getenv("ENTRY_TIMEOUT_MIN", "120"))
-POLL_OPEN_ORDERS_SEC = int(os.getenv("POLL_OPEN_ORDERS_SEC", "20"))
 VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip()
 
 # --- SDK (for signing/placing only) -----------------------------------------
@@ -110,16 +106,13 @@ def _symbol_to_coin(symbol: str) -> str:
     return s.split("/")[0] if "/" in s else s
 
 def _coin_aliases(coin: str) -> List[str]:
-    """Try multiple coin labels the API might accept."""
     c = coin.upper()
     base = c.split("/")[0]
-    alts = {c, base, base + "USD", base + "-USD"}  # ETH, ETHUSD, ETH-USD
-    return list(alts)
+    return list({c, base, f"{base}USD", f"{base}-USD"})
 
 # --- Price helpers -----------------------------------------------------------
 
 def _get_mark_price_http(coin: str) -> Optional[float]:
-    """Robust HTTP-only mark resolver. Try allMids, then l2Book, then recentTrades, then 1m candle close."""
     for sym in _coin_aliases(coin):
         # allMids
         try:
@@ -129,9 +122,8 @@ def _get_mark_price_http(coin: str) -> Optional[float]:
                 val = mids.get(sym)
                 if val is not None:
                     return float(val)
-        except Exception as e:
-            LOG.debug("allMids failed for %s: %s", sym, e)
-
+        except Exception:
+            pass
         # l2Book midpoint
         try:
             resp = _http_info({"type": "l2Book", "coin": sym, "nSigFigs": 5, "mantissa": None})
@@ -141,10 +133,9 @@ def _get_mark_price_http(coin: str) -> Optional[float]:
                 best_bid = float(levels[0][0]["px"])
                 best_ask = float(levels[1][0]["px"])
                 return (best_bid + best_ask) / 2.0
-        except Exception as e:
-            LOG.debug("l2Book failed for %s: %s", sym, e)
-
-        # recentTrades last price
+        except Exception:
+            pass
+        # recentTrades last
         try:
             resp = _http_info({"type": "recentTrades", "coin": sym, "n": 1})
             trades = resp.get("data") or resp.get("trades") or []
@@ -152,30 +143,20 @@ def _get_mark_price_http(coin: str) -> Optional[float]:
                 px = trades[0].get("px")
                 if px is not None:
                     return float(px)
-        except Exception as e:
-            LOG.debug("recentTrades failed for %s: %s", sym, e)
-
-        # candleSnapshot close
+        except Exception:
+            pass
+        # 1m candle close
         try:
             resp = _http_info({"type": "candleSnapshot", "interval": "1m", "coin": sym, "n": 1})
-            # Response shapes vary; accept both {"data":{"candles":[...]}} and {"candles":[...]}
             candles = (resp.get("data") or {}).get("candles") or resp.get("candles") or []
             if isinstance(candles, list) and candles:
-                # candle fields sometimes objects, sometimes arrays; handle both
                 c0 = candles[-1]
                 close = c0.get("c") if isinstance(c0, dict) else (c0[4] if isinstance(c0, (list, tuple)) and len(c0) >= 5 else None)
                 if close is not None:
                     return float(close)
-        except Exception as e:
-            LOG.debug("candleSnapshot failed for %s: %s", sym, e)
-
+        except Exception:
+            pass
     return None
-
-def _get_mark_price(coin: str) -> float:
-    mark = _get_mark_price_http(coin)
-    if mark is None:
-        raise RuntimeError("Could not compute size from mark price; aborting.")
-    return mark
 
 # --- Quantization ------------------------------------------------------------
 
@@ -350,7 +331,6 @@ def _build_order_plan(*, side: str, coin: str, band_low: float, band_high: float
     side_up = side.upper()
     px_entry = band_low if side_up == "SHORT" else band_high
 
-    # Mark for sizing; if it fails, gracefully fallback to entry price
     mark = _get_mark_price_http(coin)
     if mark is None:
         LOG.warning("[PRICE] mark fetch failed for %s; falling back to entry price for sizing", coin)
@@ -359,7 +339,7 @@ def _build_order_plan(*, side: str, coin: str, band_low: float, band_high: float
     if FIXED_QTY:
         base_qty = float(FIXED_QTY)
     else:
-        notional = max(TRADE_SIZE_USD, 10.0)  # HL minimum notional is $10
+        notional = max(TRADE_SIZE_USD, 10.0)
         base_qty = notional / max(mark, 1e-9)
 
     size_str = quantize_size(coin, base_qty)
@@ -410,7 +390,6 @@ def _place_order_real(plan: Dict) -> None:
             LOG.warning("[HL] update_leverage failed on %s: %s", coin, e)
 
     orders = []
-    # entry
     orders.append({
         "a": asset,
         "b": is_buy,
@@ -419,7 +398,6 @@ def _place_order_real(plan: Dict) -> None:
         "r": False,
         "t": {"limit": {"tif": tif}},
     })
-    # tps
     for tp in tps:
         orders.append({
             "a": asset,
@@ -429,7 +407,6 @@ def _place_order_real(plan: Dict) -> None:
             "r": True,
             "t": {"trigger": {"isMarket": True, "triggerPx": tp["px"], "tpsl": "tp"}},
         })
-    # sl
     if sl:
         orders.append({
             "a": asset,
@@ -440,23 +417,9 @@ def _place_order_real(plan: Dict) -> None:
             "t": {"trigger": {"isMarket": True, "triggerPx": sl["px"], "tpsl": "sl"}},
         })
 
-    try:
-        res = ex.place_orders(
-            orders=orders,
-            grouping=grouping,
-            vault_address=VAULT_ADDRESS or None,
-        )
-        LOG.info("[HL] order response: %s", str(res))
-    except Exception as e:
-        msg = str(e)
-        if "MinTradeNtl" in msg:
-            LOG.error("Rejected: below minimum $10 notional.")
-        elif "BadTriggerPx" in msg:
-            LOG.error("Rejected: invalid TP/SL trigger price.")
-        elif "PerpMargin" in msg:
-            LOG.error("Rejected: insufficient margin.")
-        elif "Tick" in msg:
-            LOG.error("Rejected: price not divisible by tick size.")
-        else:
-            LOG.error("[HL] placement failed: %s", msg)
-        raise
+    res = ex.place_orders(
+        orders=orders,
+        grouping=grouping,
+        vault_address=VAULT_ADDRESS or None,
+    )
+    LOG.info("[HL] order response: %s", str(res))
