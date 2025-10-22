@@ -6,7 +6,7 @@ import math
 import logging
 from typing import Any, Dict, Optional, Tuple
 
-__VERSION__ = "hl-broker-1.2.0"
+__VERSION__ = "hl-broker-1.2.1"
 
 log = logging.getLogger("broker.hyperliquid")
 if not log.handlers:
@@ -18,7 +18,7 @@ log.setLevel(logging.INFO)
 log.info(f"[BROKER] hyperliquid.py loaded, version={__VERSION__}")
 
 # -----------------------
-# Env
+# Env helpers
 # -----------------------
 
 def _getenv_bool(key: str, default: bool = False) -> bool:
@@ -33,6 +33,7 @@ def _getenv_float(key: str, default: float) -> float:
     except Exception:
         return default
 
+# Core env
 HYPER_DRY_RUN = _getenv_bool("HYPER_DRY_RUN", False) or _getenv_bool("hyper_dry_run", False)
 HL_NETWORK = (os.getenv("HL_NETWORK") or os.getenv("HYPER_NETWORK") or "mainnet").strip().lower()
 USER_ADDRESS = (os.getenv("HL_ADDRESS") or os.getenv("HYPER_USER_ADDRESS") or "").strip() or None
@@ -49,6 +50,7 @@ AGENT_WALLET_PK = (
 ).strip()
 
 DEFAULT_TIF = (os.getenv("HYPER_DEFAULT_TIF") or "Gtc").strip()
+
 ALLOWED = (os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS") or "").strip()
 ALLOWED_SET = set([s.strip().upper() for s in ALLOWED.split(",") if s.strip()])
 
@@ -60,21 +62,27 @@ USD_PER_ORDER = _getenv_float("HYPER_ORDER_USD_AMT", 50.0)
 
 _EXC: Optional[Any] = None
 _INFO: Optional[Any] = None
-_CHAIN = None
+_CHAIN: Optional[Any] = None
 
 def _resolve_chain() -> Any:
+    """
+    Force the SDK's Chain enum; do NOT fall back to strings (that breaks the SDK’s ws url derivation).
+    """
     global _CHAIN
     if _CHAIN is not None:
         return _CHAIN
     try:
         from hyperliquid.exchange import Chain
-        _CHAIN = Chain.TESTNET if HL_NETWORK.startswith("test") else Chain.MAINNET
-    except Exception:
-        _CHAIN = "testnet" if HL_NETWORK.startswith("test") else "mainnet"
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to import hyperliquid.exchange.Chain from the SDK. "
+            "Ensure hyperliquid-python-sdk is installed."
+        ) from e
+    _CHAIN = Chain.TESTNET if HL_NETWORK.startswith("test") else Chain.MAINNET
     return _CHAIN
 
 def _get_info():
-    """Cache an Info client."""
+    """Cache an Info client constructed with Chain enum (prevents invalid ws url)."""
     global _INFO
     if _INFO is not None:
         return _INFO
@@ -84,17 +92,20 @@ def _get_info():
         _INFO = Info(chain)
         return _INFO
     except TypeError:
-        # fallback base-url signature
+        # Older SDKs that take a base-url only
         try:
             from hyperliquid.info import Info
-            base = "https://api.hyperliquid-testnet.xyz" if str(chain).lower().endswith("testnet") else "https://api.hyperliquid.xyz"
+            base = "https://api.hyperliquid-testnet.xyz" if HL_NETWORK.startswith("test") else "https://api.hyperliquid.xyz"
             _INFO = Info(base)
             return _INFO
         except Exception as e:
             raise RuntimeError(f"Unable to construct Info client: {e}") from e
 
 def _get_exchange():
-    """Cache an Exchange client using API/agent wallet PK."""
+    """
+    Cache an Exchange client using the Chain enum.
+    If your SDK supports Chain, we pass it. We do not pass empty/invalid urls.
+    """
     global _EXC
     if _EXC is not None:
         return _EXC
@@ -103,9 +114,10 @@ def _get_exchange():
     chain = _resolve_chain()
     from hyperliquid.exchange import Exchange
     last_err: Optional[Exception] = None
+    # Try clean signatures first
     for kwargs in (
         {"private_key": AGENT_WALLET_PK, "chain": chain},
-        {"key": AGENT_WALLET_PK, "chain": chain},
+        {"key": AGENT_WALLET_PK, "chain": chain},  # some older builds used 'key'
         {"private_key": AGENT_WALLET_PK, "account_address": USER_ADDRESS, "chain": chain},
     ):
         try:
@@ -143,7 +155,7 @@ def _get_mark_price(coin: str) -> Optional[float]:
     try:
         if hasattr(info, "all_mids"):
             mids = info.all_mids()
-            mid_s = mids.get(coin)
+            mid_s = mids.get(coin) if isinstance(mids, dict) else None
             if mid_s is not None:
                 return float(mid_s)
     except Exception as e:
@@ -206,10 +218,10 @@ def _place_order_real(
         is_buy: bool,
         sz: float,
         limit_px: float,
-        order_type: OrderType,
+        order_type: hyperliquid.utils.signing.OrderType,
         reduce_only: bool = False,
-        cloid: Optional[Cloid] = None,
-        builder: Optional[BuilderInfo] = None
+        cloid: Optional[hyperliquid.utils.types.Cloid] = None,
+        builder: Optional[hyperliquid.utils.types.BuilderInfo] = None
       )
     """
     ex = _get_exchange()
