@@ -174,53 +174,60 @@ def submit_signal(sig: Any) -> None:
     Accepts an ExecSignal-like object with attributes:
       - side: 'LONG' or 'SHORT'
       - symbol: like 'BTC/USD'
-      - band_low, band_high (floats)
-      - stop_loss (float)  [optional for this simple entry, not used here]
-      - leverage (float)   [optional; not used for sizing here]
+      - band_low/band_high  OR entry_low/entry_high  OR band=(low, high)
+      - stop_loss (optional float)
+      - leverage (optional float)
       - tif (optional str) [PostOnly/Gtc/Ioc]
-      - base_usd (optional float) notional to size from; default BASE_USD
+      - base_usd (optional float)
     """
     symbol = getattr(sig, "symbol")
     side = getattr(sig, "side")
     if not symbol or not side:
         raise ValueError("Signal missing side and/or symbol.")
-
     if not _allowed(symbol):
         log.info(f"[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: {symbol}")
         return
 
+    # --- tolerant band extraction ---
     band_low = getattr(sig, "band_low", None)
     band_high = getattr(sig, "band_high", None)
+
+    if band_low is None or band_high is None:
+        # sometimes the parser gives a tuple .band = (low, high)
+        band = getattr(sig, "band", None)
+        if isinstance(band, (tuple, list)) and len(band) == 2:
+            band_low, band_high = band
+
+    if band_low is None or band_high is None:
+        # sometimes it's entry_low/entry_high
+        band_low = getattr(sig, "entry_low", band_low)
+        band_high = getattr(sig, "entry_high", band_high)
+
     if band_low is None or band_high is None:
         raise ValueError("Signal missing entry_band=(low, high).")
 
+    band_low = float(band_low)
+    band_high = float(band_high)
+    # --------------------------------
+
     tif = getattr(sig, "tif", None) or DEFAULT_TIF
-
     ex, info = _mk_clients()
-
     coin = _split_symbol(symbol)
     is_buy = str(side).upper() == "LONG"
 
-    # Mid price entry
-    px = _mid(float(band_low), float(band_high))
-
-    # Basic sizing: use BASE_USD notional unless a base_usd override is carried in sig.
+    px = _mid(band_low, band_high)
     notional = float(getattr(sig, "base_usd", BASE_USD))
-    # Guard for zero price
     px_safe = max(float(px), 1e-9)
     raw_sz = notional / px_safe
-
-    # Trim to avoid wire rounding issues
     sz = _trim_size_for_sdk(raw_sz)
 
     order = _post_only_order_dict(coin=coin, is_buy=is_buy, sz=sz, px=px, tif=tif)
 
-    log.info(f"[BROKER] {side} {symbol} band=({float(band_low):.6f},{float(band_high):.6f}) "
+    log.info(f"[BROKER] {side} {symbol} band=({band_low:.6f},{band_high:.6f}) "
              f"SL={getattr(sig, 'stop_loss', None)} lev={getattr(sig, 'leverage', None)} TIF={tif}")
     log.info(f"[BROKER] PLAN side={'BUY' if is_buy else 'SELL'} coin={coin} "
              f"px={float(px):.8f} sz={sz} tif={tif} reduceOnly=False")
 
-    # Place the order, coping with SDK float/signing quirks
     try:
         resp = _try_bulk_with_rounding(ex, order)
     except Exception as e:
