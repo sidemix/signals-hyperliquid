@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re
+import inspect
 import discord
 
 from parser import parse_signal
@@ -23,11 +24,79 @@ AUTHOR_ALLOWLIST = {
 }
 
 
+def _extract_text(message: discord.Message) -> str:
+    """Return message text with fenced code blocks removed."""
+    text = getattr(message, "clean_content", None) or message.content or ""
+    return re.sub(r"```.*?```", "", text, flags=re.S).strip()
+
+
+def _build_execsignal_kwargs(psig) -> dict:
+    """
+    Map the parsed signal into ExecSignal's actual __init__ parameter names.
+    Supports both old and new shapes:
+      - entry_band=(low, high)  OR  band_low/band_high
+      - symbol OR symbol_sig
+      - tps OR take_profits
+      - timeframe OR tf
+      - stop_loss OR sl
+      - leverage OR lev
+    """
+    params = set(inspect.signature(ExecSignal).parameters.keys())
+
+    # Base values from parser
+    low, high = psig.entry_band
+    kwargs = {
+        # side is consistent in all versions
+        "side": psig.side,
+    }
+
+    # symbol
+    if "symbol" in params:
+        kwargs["symbol"] = psig.symbol
+    elif "symbol_sig" in params:
+        kwargs["symbol_sig"] = psig.symbol
+
+    # band / entry range
+    if "entry_band" in params:
+        kwargs["entry_band"] = (low, high)
+    else:
+        # assume split band fields
+        if "band_low" in params:
+            kwargs["band_low"] = low
+        if "band_high" in params:
+            kwargs["band_high"] = high
+
+    # stop loss
+    if "stop_loss" in params:
+        kwargs["stop_loss"] = psig.stop_loss
+    elif "sl" in params:
+        kwargs["sl"] = psig.stop_loss
+
+    # take profits list
+    if "tps" in params:
+        kwargs["tps"] = psig.take_profits
+    elif "take_profits" in params:
+        kwargs["take_profits"] = psig.take_profits
+
+    # leverage
+    if "leverage" in params:
+        kwargs["leverage"] = psig.leverage
+    elif "lev" in params:
+        kwargs["lev"] = psig.leverage
+
+    # timeframe
+    if "timeframe" in params:
+        kwargs["timeframe"] = psig.timeframe
+    elif "tf" in params:
+        kwargs["tf"] = psig.timeframe
+
+    return kwargs
+
+
 class Bot(discord.Client):
     async def on_ready(self):
         tag = f"{self.user}#{getattr(self.user, 'discriminator', '')}"
         log.info("[READY] Logged in as %s | target CHANNEL_ID=%s", tag, DISCORD_CHANNEL_ID)
-        # Say hi so we know the bot is alive
         try:
             ch = await self.fetch_channel(DISCORD_CHANNEL_ID)
             await ch.send("👋 bot online")
@@ -38,16 +107,14 @@ class Bot(discord.Client):
 
     async def on_message(self, message: discord.Message):
         try:
-            # ignore our own messages
+            # Ignore our own messages
             if message.author.id == self.user.id:
                 log.info("[DROP] our own message")
                 return
 
-            # restrict channel
             if message.channel.id != DISCORD_CHANNEL_ID:
                 return
 
-            # restrict authors (optional)
             if AUTHOR_ALLOWLIST and message.author.name.lower() not in AUTHOR_ALLOWLIST:
                 log.info("[SKIP] author '%s' not in allowlist", message.author.name)
                 return
@@ -80,43 +147,35 @@ class Bot(discord.Client):
                 psig.timeframe,
             )
 
-            # IMPORTANT: ExecSignal now expects symbol=<...> (not symbol_sig)
-            exec_sig = ExecSignal(
-                side=psig.side,
-                symbol=psig.symbol,
-                entry_band=psig.entry_band,
-                stop_loss=psig.stop_loss,
-                # If your ExecSignal uses a different name than 'tps', change here.
-                tps=psig.take_profits,
-                leverage=psig.leverage,
-                timeframe=psig.timeframe,
-            )
+            kwargs = _build_execsignal_kwargs(psig)
+            exec_sig = ExecSignal(**kwargs)
 
-            # Be tolerant about attribute name for logs
+            # For logging, be tolerant to symbol naming
             sym_for_log = getattr(exec_sig, "symbol", getattr(exec_sig, "symbol_sig", "<?>"))
+            # entry band unified for logs
+            if hasattr(exec_sig, "entry_band"):
+                lo, hi = exec_sig.entry_band
+            else:
+                lo = getattr(exec_sig, "band_low", band_low)
+                hi = getattr(exec_sig, "band_high", band_high)
+
             log.info(
                 "[EXEC] %s %s band=(%.6f, %.6f) SL=%s lev=%s TF=%s",
                 exec_sig.side,
                 sym_for_log,
-                exec_sig.entry_band[0],
-                exec_sig.entry_band[1],
-                f"{exec_sig.stop_loss:.6f}" if exec_sig.stop_loss is not None else "None",
-                exec_sig.leverage,
-                exec_sig.timeframe,
+                lo,
+                hi,
+                f"{getattr(exec_sig, 'stop_loss', getattr(exec_sig, 'sl', None)):.6f}"
+                if getattr(exec_sig, "stop_loss", getattr(exec_sig, "sl", None)) is not None
+                else "None",
+                getattr(exec_sig, "leverage", getattr(exec_sig, "lev", None)),
+                getattr(exec_sig, "timeframe", getattr(exec_sig, "tf", None)),
             )
 
             execute_signal(exec_sig)
 
         except Exception as e:
             log.exception("[ERR] on_message: %s", e)
-
-
-def _extract_text(message: discord.Message) -> str:
-    """Return message text with code blocks stripped."""
-    text = getattr(message, "clean_content", None) or message.content or ""
-    # remove fenced code blocks
-    text = re.sub(r"```.*?```", "", text, flags=re.S)
-    return text.strip()
 
 
 def start():
