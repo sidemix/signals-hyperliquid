@@ -1,225 +1,147 @@
-import os
+# broker/hyperliquid.py
+# Compatible broker for multiple hyperliquid SDK variants.
+from __future__ import annotations
+
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
-
-# ---------- Hyperliquid SDK (support multiple layouts) ----------
-try:
-    from hyperliquid.exchange import Exchange
-    from hyperliquid.info import Info
-except Exception:  # older SDKs
-    from hyperliquid import Exchange, Info  # type: ignore
-
-# Wallet moved between modules across versions
-_Wallet = None
-for _cand in ("hyperliquid.wallet", "hyperliquid.utils.wallet"):
-    try:
-        _mod = __import__(_cand, fromlist=["Wallet"])
-        _Wallet = getattr(_mod, "Wallet")
-        break
-    except Exception:
-        pass
-
-# Legacy path: agent with eth-account (only used if Wallet is missing)
-try:
-    from eth_account import Account  # noqa: F401
-    from eth_account.messages import SignableMessage  # noqa: F401
-    _HAS_ETH = True
-except Exception:
-    _HAS_ETH = False
-
-# ---------- Config ----------
-_BASE_URLS = {
-    "mainnet": "https://api.hyperliquid.xyz",
-    "testnet": "https://api.hyperliquid-testnet.xyz",
-}
+from typing import Any, Dict, Optional, Tuple
 
 log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
 
+# --- SDK imports (tolerate version differences) -----------------------------
+try:
+    # Modern split packages
+    from hyperliquid.exchange import Exchange      # type: ignore
+    from hyperliquid.info import Info              # type: ignore
+except Exception:
+    # Older single-namespace builds
+    from hyperliquid import Exchange, Info         # type: ignore  # noqa: F401
 
-def _env(name: str, default: str | None = None) -> str | None:
-    v = os.environ.get(name, default)
-    if isinstance(v, str):
-        v = v.strip()
-    return v
+# Some builds have dataclass order types; many accept dicts too.
+try:
+    from hyperliquid.utils.signing import OrderType  # type: ignore
+except Exception:
+    OrderType = None  # type: ignore
 
+# --- ENV --------------------------------------------------------------------
+ONLY = {s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()}
+DEFAULT_TIF = os.getenv("HYPER_TIF", "PostOnly")
+PRIVKEY = os.getenv("HYPER_PRIVATE_KEY")  # Agent wallet private key hex
 
-def _get_allowed_symbols() -> set[str] | None:
-    csv = _env("HYPER_ONLY_EXECUTE_SYMBOLS")
-    if not csv:
-        return None
-    return {s.strip().upper() for s in csv.split(",") if s.strip()}
-
-
+# --- Small helpers ----------------------------------------------------------
 def _round8(x: float) -> float:
-    """Round DOWN to 8 dp to avoid float_to_wire rounding guards."""
-    return float(Decimal(str(x)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN))
+    return float(f"{x:.8f}")
 
-
-# ---------- Legacy agent for older SDKs ----------
-class _EthAccountAgent:
-    """
-    Minimal agent compatible with older Hyperliquid SDKs:
-      - must expose .address
-      - must implement sign_message(SignableMessage) -> bytes
-    """
-    def __init__(self, priv_hex: str):
-        from eth_account import Account as _Acct
-        self._acct = _Acct.from_key(priv_hex)
-
-    @property
-    def address(self) -> str:
-        return self._acct.address
-
-    # NOTE: SDK will pass an eth_account.messages.SignableMessage
-    def sign_message(self, signable):
-        from eth_account import Account as _Acct
-        sig = _Acct.sign_message(signable, private_key=self._acct.key)
-        return sig.signature  # bytes
-
-
-def _mk_clients():
-    """Create Exchange and Info using whatever style this SDK supports."""
-    priv = _env("HYPER_PRIVATE_KEY")
-    if not priv:
-        raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
-
-    network = (_env("HYPER_NETWORK") or "mainnet").lower()
-    base_url = _BASE_URLS.get(network, _BASE_URLS["mainnet"])
-
-    ex = None
-    last_err = None
-
-    # Preferred path: Wallet
-    if _Wallet is not None:
-        wallet = _Wallet(priv)
-        for ctor in (
-            lambda: Exchange(wallet=wallet, base_url=base_url),
-            lambda: Exchange(wallet),            # positional wallet
-            lambda: Exchange(wallet=wallet),     # SDK with default base_url
-        ):
-            try:
-                ex = ctor()
-                break
-            except Exception as e:
-                last_err = e
-
-    # Fallback path: legacy agent style
-    if ex is None and _HAS_ETH:
-        agent = _EthAccountAgent(priv)
-        for ctor in (
-            lambda: Exchange(agent=agent, base_url=base_url),
-            lambda: Exchange(agent=agent),
-            lambda: Exchange(agent),             # positional agent
-        ):
-            try:
-                ex = ctor()
-                break
-            except Exception as e:
-                last_err = e
-
-    if ex is None:
-        if _Wallet is None and not _HAS_ETH:
-            raise RuntimeError(
-                "This SDK lacks Wallet and eth-account isn't available; "
-                "install either a newer hyperliquid SDK (with Wallet) or add eth-account."
-            )
-        raise RuntimeError(f"Could not construct Exchange with any style: {last_err}")
-
-    # Info also changed across versions; try a couple styles
-    info = None
-    last_err = None
-    for ctor in (lambda: Info(base_url=base_url), lambda: Info()):
+def _normalize_resp(resp: Any) -> Any:
+    """Convert bytes/bytearray responses to JSON/dict when possible."""
+    if isinstance(resp, (bytes, bytearray)):
         try:
-            info = ctor()
-            break
-        except Exception as e:
-            last_err = e
-    if info is None:
-        raise RuntimeError(f"Could not construct Info with any style: {last_err}")
+            return json.loads(resp.decode())
+        except Exception:
+            # Some SDKs return b'OK' etc.; just return as-is if not JSON.
+            return resp
+    return resp
 
-    log.info("[BROKER] hyperliquid.py loaded")
-    return ex, info, base_url
-
-
-@dataclass
-class _Plan:
-    side: str          # BUY or SELL
-    coin: str          # e.g., BTC
-    px: float          # limit price (8dp)
-    sz: float          # size in coin (8dp)
-    tif: str           # "PostOnly" or "Gtc"
-    reduceOnly: bool = False
-
-
-def _make_plan(side: str, symbol: str, entry_low: float, entry_high: float, lev: float | None) -> _Plan:
-    coin = symbol.split("/")[0].upper()
-    mid = (float(entry_low) + float(entry_high)) / 2.0
-    px = _round8(mid)
-
-    # Sizing — small default notional, leverage multiplies notional target
-    notional = float(_env("HYPER_NOTIONAL_USD", "50") or "50")
-    if lev and float(lev) > 0:
-        notional *= float(lev)
-    sz = _round8(notional / px)
-
-    tif_env = (_env("HYPER_DEFAULT_TIF") or "PostOnly").strip()
-    tif = "PostOnly" if tif_env.lower() == "postonly" else "Gtc"
-
-    return _Plan(side=side, coin=coin, px=px, sz=sz, tif=tif)
-
-
-def _order_type_from_tif(tif: str) -> dict:
-    # Preferred modern shape: limit tif=Gtc/Ioc/Alo
-    t = tif.strip().lower()
+def _order_type_from_tif(tif: str) -> Dict[str, Any]:
+    """
+    Preferred modern shape uses Limit tif=Gtc/Ioc/Alo (Alo == post-only).
+    We emit that first, and let the caller retry with legacy if needed.
+    """
+    t = (tif or "").strip().lower()
     if t == "postonly":
-        # Alo == Add Liquidity Only (post-only)
         return {"limit": {"tif": "Alo"}}
     if t in ("gtc", "ioc", "alo"):
-        return {"limit": {"tif": tif if tif in ("Gtc", "Ioc", "Alo") else tif.capitalize()}}
-    # default
+        # Keep correct capitalization expected by many services
+        cap = {"gtc": "Gtc", "ioc": "Ioc", "alo": "Alo"}[t]
+        return {"limit": {"tif": cap}}
     return {"limit": {"tif": "Gtc"}}
 
+def _legacy_post_only() -> Dict[str, Any]:
+    """Legacy post-only order_type some gateways expect."""
+    return {"postOnly": {}}
 
-def _build_order(plan: _Plan) -> dict:
-    return {
-        "coin": plan.coin,
-        "is_buy": True if plan.side == "BUY" else False,
-        "sz": _round8(plan.sz),
-        "limit_px": _round8(plan.px),
-        "order_type": _order_type_from_tif(plan.tif),
-        "reduce_only": bool(plan.reduceOnly),
-    }
+def _should_skip(symbol: str) -> bool:
+    if not ONLY:
+        return False
+    return symbol.upper() not in ONLY
 
+# --- Public signal wire model we receive from executor ----------------------
+@dataclass
+class ExecSignal:
+    side: str                # "LONG" or "SHORT"
+    symbol: str              # "BTC/USD" etc.
+    entry_low: float
+    entry_high: float
+    stop_loss: Optional[float]
+    leverage: Optional[float]
+    tif: Optional[str] = None
 
-def _try_bulk_with_rounding(ex: "Exchange", order: dict) -> dict:
-    """Call bulk_orders; if type/rounding issues arise, fix and retry."""
+# --- Wallet/clients ---------------------------------------------------------
+def _mk_clients() -> Tuple[Any, Any]:
+    """
+    Create Exchange + Info using just the private key. Different SDK builds
+    accept different ctor styles; we try common ones.
+    """
+    if not PRIVKEY:
+        raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
+
+    # Try: Exchange(wallet=<hex>) – modern builds
+    last_err = None
+    try:
+        ex = Exchange(wallet=PRIVKEY)  # type: ignore
+        info = Info()
+        return ex, info
+    except Exception as e:  # noqa: BLE001
+        last_err = e
+
+    # Try: Exchange(privkey=<hex>) – older builds
+    try:
+        ex = Exchange(privkey=PRIVKEY)  # type: ignore
+        info = Info()
+        return ex, info
+    except Exception as e:  # noqa: BLE001
+        last_err = e
+
+    raise RuntimeError(f"Could not construct Exchange with any style: {last_err}")
+
+# --- Bulk with robustness ---------------------------------------------------
+def _try_bulk_with_rounding(ex: Any, order: Dict[str, Any]) -> Any:
+    """
+    Call bulk_orders with:
+      1) preferred Alo shape
+      2) legacy postOnly fallback if server says order type invalid
+      3) gentle size nudges to avoid float_to_wire rounding guards
+      4) response normalization (bytes -> json)
+    """
+    order = dict(order)  # copy for mutation
     order["sz"] = float(order["sz"])
     order["limit_px"] = float(order["limit_px"])
 
-    def _bulk(o):
-        return ex.bulk_orders([o])
+    def _bulk(o: Dict[str, Any]) -> Any:
+        resp = ex.bulk_orders([o])
+        return _normalize_resp(resp)
 
+    # 1) preferred attempt
     try:
         return _bulk(order)
-    except Exception as e:
-        last_err = e
-        msg = str(e)
+    except Exception as e1:  # noqa: BLE001
+        msg1 = str(e1)
+        # 2) legacy fallback on order type complaint
+        if "Invalid order type" in msg1 or "'postOnly'" in msg1:
+            legacy = dict(order)
+            legacy["order_type"] = _legacy_post_only()
+            try:
+                return _bulk(legacy)
+            except Exception as e2:  # noqa: BLE001
+                last_err = e2
+        else:
+            last_err = e1
 
-        # If this SDK/server doesn't accept {"limit":{"tif":"Alo"}}, try legacy {"postOnly": {}}
-        if "Invalid order type" in msg:
-            ot = order.get("order_type", {})
-            if ot == {"limit": {"tif": "Alo"}}:
-                # legacy fallback
-                legacy = dict(order)
-                legacy["order_type"] = {"postOnly": {}}
-                try:
-                    return _bulk(legacy)
-                except Exception as e2:
-                    last_err = e2
-
-    # If we reached here, try size nudges to dodge float_to_wire guards
+    # 3) nudge size down slightly to dodge rounding traps
     step = 1e-8
     for _ in range(6):
         new_sz = max(0.0, float(order["sz"]) - step)
@@ -227,50 +149,62 @@ def _try_bulk_with_rounding(ex: "Exchange", order: dict) -> dict:
             break
         order["sz"] = _round8(new_sz)
         try:
-            return ex.bulk_orders([order])
-        except Exception as e:
-            last_err = e
+            return _bulk(order)
+        except Exception as e3:  # noqa: BLE001
+            last_err = e3
 
     raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
 
-
-
-def submit_signal(sig) -> None:
-    """Entry point used by execution.py."""
-    if getattr(sig, "entry_low", None) is None or getattr(sig, "entry_high", None) is None:
-        raise ValueError("Signal missing entry_band=(low, high).")
-
-    side_raw = str(getattr(sig, "side", "")).upper()
-    if side_raw.startswith(("LONG", "BUY")):
-        side = "BUY"
-    elif side_raw.startswith(("SHORT", "SELL")):
-        side = "SELL"
-    else:
-        raise ValueError(f"Unsupported side: {getattr(sig, 'side')}")
-
-    symbol = str(getattr(sig, "symbol"))
-    allowed = _get_allowed_symbols()
-    if allowed is not None and symbol.upper() not in allowed:
+# --- Main entry -------------------------------------------------------------
+def submit_signal(sig: ExecSignal) -> None:
+    """
+    Submit a single banded entry order as a post-only limit at mid-band.
+    """
+    symbol = sig.symbol.upper()
+    side = sig.side.upper()
+    if _should_skip(symbol):
         log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol)
         return
 
-    entry_low = float(getattr(sig, "entry_low"))
-    entry_high = float(getattr(sig, "entry_high"))
-    sl = getattr(sig, "stop_loss", None)
-    lev = getattr(sig, "lev", None)
+    if sig.entry_low is None or sig.entry_high is None:
+        raise ValueError("Signal missing entry_band=(low, high).")
 
-    ex, _info, _base = _mk_clients()
+    # Exchange + Info
+    ex, info = _mk_clients()
+    log.info("[BROKER] hyperliquid.py loaded")
 
-    plan = _make_plan(side, symbol, entry_low, entry_high, lev)
-    log.info(
-        "[BROKER] %s %s band=(%f,%f) SL=%s lev=%s TIF=%s",
-        side, symbol, entry_low, entry_high, str(sl), str(lev), plan.tif
-    )
-    log.info(
-        "[BROKER] PLAN side=%s coin=%s px=%0.8f sz=%0.8f tif=%s reduceOnly=%s",
-        plan.side, plan.coin, plan.px, plan.sz, plan.tif, plan.reduceOnly
-    )
+    # Build an order near the middle of the band
+    coin = symbol.split("/")[0]
+    mid_px = (float(sig.entry_low) + float(sig.entry_high)) / 2.0
+    px = _round8(mid_px)
 
-    order = _build_order(plan)
+    # Notional -> size (use 50 USD default if not supplied elsewhere)
+    notional_usd = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
+    # Guard against zero price
+    sz = _round8(max(1e-8, notional_usd / max(px, 1e-8)))
+
+    # Side/flags
+    is_buy = side == "LONG"
+    tif = (sig.tif or DEFAULT_TIF or "PostOnly").strip()
+
+    # Order type pref (Alo), fallback handled inside _try_bulk_with_rounding
+    order_type = _order_type_from_tif(tif)
+
+    order: Dict[str, Any] = {
+        "coin": coin,
+        "is_buy": is_buy,
+        "sz": sz,
+        "limit_px": px,
+        "order_type": order_type,
+        "reduce_only": False,
+    }
+
+    log.info("[BROKER] BUY %s band=(%f,%f) SL=%s lev=%s TIF=%s",
+             symbol, float(sig.entry_low), float(sig.entry_high),
+             str(sig.stop_loss), str(sig.leverage), tif)
+    log.info("[BROKER] PLAN side=%s coin=%s px=%0.8f sz=%0.8f tif=%s reduceOnly=%s",
+             "BUY" if is_buy else "SELL", coin, px, sz, tif, False)
+
+    # Place via resilient path
     resp = _try_bulk_with_rounding(ex, order)
-    log.info("[BROKER] bulk_orders OK: %s", resp)
+    log.info("[BROKER] bulk_orders response: %s", resp)
