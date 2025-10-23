@@ -171,9 +171,15 @@ def _make_plan(side: str, symbol: str, entry_low: float, entry_high: float, lev:
 
 
 def _order_type_from_tif(tif: str) -> dict:
-    if tif.lower() == "postonly":
-        return {"postOnly": {}}
-    return {"limit": {"tif": tif}}
+    # Preferred modern shape: limit tif=Gtc/Ioc/Alo
+    t = tif.strip().lower()
+    if t == "postonly":
+        # Alo == Add Liquidity Only (post-only)
+        return {"limit": {"tif": "Alo"}}
+    if t in ("gtc", "ioc", "alo"):
+        return {"limit": {"tif": tif if tif in ("Gtc", "Ioc", "Alo") else tif.capitalize()}}
+    # default
+    return {"limit": {"tif": "Gtc"}}
 
 
 def _build_order(plan: _Plan) -> dict:
@@ -188,15 +194,32 @@ def _build_order(plan: _Plan) -> dict:
 
 
 def _try_bulk_with_rounding(ex: "Exchange", order: dict) -> dict:
-    """Call bulk_orders; if wire rounding hits, nudge size down by 1e-8 a few times."""
+    """Call bulk_orders; if type/rounding issues arise, fix and retry."""
     order["sz"] = float(order["sz"])
     order["limit_px"] = float(order["limit_px"])
 
+    def _bulk(o):
+        return ex.bulk_orders([o])
+
     try:
-        return ex.bulk_orders([order])
+        return _bulk(order)
     except Exception as e:
         last_err = e
+        msg = str(e)
 
+        # If this SDK/server doesn't accept {"limit":{"tif":"Alo"}}, try legacy {"postOnly": {}}
+        if "Invalid order type" in msg:
+            ot = order.get("order_type", {})
+            if ot == {"limit": {"tif": "Alo"}}:
+                # legacy fallback
+                legacy = dict(order)
+                legacy["order_type"] = {"postOnly": {}}
+                try:
+                    return _bulk(legacy)
+                except Exception as e2:
+                    last_err = e2
+
+    # If we reached here, try size nudges to dodge float_to_wire guards
     step = 1e-8
     for _ in range(6):
         new_sz = max(0.0, float(order["sz"]) - step)
@@ -209,6 +232,7 @@ def _try_bulk_with_rounding(ex: "Exchange", order: dict) -> dict:
             last_err = e
 
     raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
+
 
 
 def submit_signal(sig) -> None:
