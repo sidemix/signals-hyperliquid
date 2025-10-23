@@ -104,11 +104,12 @@ def _mk_clients() -> Tuple[Exchange, Info]:
 
     agent = _mk_agent_from_privkey(priv)
 
-    # SDK constructor signatures vary; try the common patterns.
     ex: Optional[Exchange] = None
     init_errors = []
 
-    # (a) Exchange(agent=..., base_url=..., websocket_url=...)
+    # Try common constructor styles
+
+    # (a) keyword args
     try:
         kwargs = {"agent": agent}
         if BASE_URL:
@@ -116,17 +117,17 @@ def _mk_clients() -> Tuple[Exchange, Info]:
         if WS_URL:
             kwargs["websocket_url"] = WS_URL
         ex = Exchange(**kwargs)  # type: ignore[arg-type]
-    except TypeError as e:
+    except Exception as e:
         init_errors.append(f"agent-kwargs: {e}")
 
-    # (b) Exchange(agent) positional
+    # (b) positional agent
     if ex is None:
         try:
             ex = Exchange(agent)  # type: ignore[misc]
         except Exception as e:
             init_errors.append(f"agent-positional: {e}")
 
-    # (c) Some very old builds took private key directly (positional). Last resort.
+    # (c) very old builds: positional privkey
     if ex is None:
         try:
             ex = Exchange(priv)  # type: ignore[misc]
@@ -137,22 +138,30 @@ def _mk_clients() -> Tuple[Exchange, Info]:
         raise RuntimeError("Failed to initialize Exchange with provided private key. "
                            f"Attempts: {', '.join(init_errors)}")
 
-    # Info may take base_url kwargs in some builds; attempt kwargs then default
-    info: Optional[Info] = None
+    # --- IMPORTANT ---
+    # Some SDK builds don't keep the agent we pass. Make sure ex.agent is our signer.
+    try:  # <<< NEW >>>
+        setattr(ex, "agent", agent)      # force the correct agent onto the Exchange  <<< NEW >>>
+    except Exception:
+        pass                              # <<< NEW >>>
+
+    # Optional: log what we ended up with (helps confirm)
+    try:  # <<< NEW >>>
+        atype = type(getattr(ex, "agent", None)).__name__
+        log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s (agent=%s)",
+                 priv[:6], priv[-4:], atype)
+    except Exception:
+        log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
+                 priv[:6], priv[-4:])
+
+    # Info client
     try:
-        if BASE_URL:
-            info = Info(base_url=BASE_URL)  # type: ignore[call-arg]
-        else:
-            info = Info()
+        info = Info(base_url=BASE_URL) if BASE_URL else Info()
     except TypeError:
         info = Info()
 
-    # Redact private key in logs
-    log.info(
-        "[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
-        priv[:6], priv[-4:]
-    )
     return ex, info
+
 
 def _build_order_dict(coin: str, is_buy: bool, sz: float, limit_px: float, tif: str) -> Dict[str, Any]:
     # Dictionary format expected by Exchange.bulk_orders([...])
