@@ -1,156 +1,161 @@
 # broker/hyperliquid.py
 import os
 import logging
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from .types import Side
+# ^ If you don't have a local types module, delete this import and use simple booleans via (side.upper()=="LONG")
+
 log = logging.getLogger("broker.hyperliquid")
+logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"), format="%(levelname)s:%(name)s:%(message)s")
 
-# --- SDK imports (0.x friendly) ---
-from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
+# --- Hyperliquid SDK imports & compatibility shims ---------------------------
+try:
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+    from hyperliquid.utils.signing import OrderType, TIF  # modern SDK
+    _ORDER_LIMIT_CLASS = True
+except Exception:
+    # Older/lighter SDKs — fall back to string payloads
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+    OrderType = None  # type: ignore
+    TIF = None        # type: ignore
+    _ORDER_LIMIT_CLASS = False
 
-# --- env ---
-API_KEY = os.getenv("HYPER_API_KEY")
-API_SECRET = os.getenv("HYPER_API_SECRET")
-PRIVKEY = os.getenv("HYPER_PRIVATE_KEY") or os.getenv("HYPER_EVM_PRIVKEY")
-ONLY = [s.strip() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()]
-DEFAULT_TIF = os.getenv("HYPER_TIF", "PostOnly")  # PostOnly | Gtc | Ioc | Fok
+VERSION = "hl-broker-compat-2.3"
+log.info("[BROKER] hyperliquid.py loaded, version=%s", VERSION)
 
-def _mask(pk: Optional[str]) -> str:
-    if not pk or len(pk) < 10:
-        return "MISSING"
-    return pk[:6] + "…" + pk[-4:]
+# --- Env ---------------------------------------------------------------------
+ALLOW = [s.strip() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()]
+DEFAULT_TIF = os.getenv("HYPER_TIF", "PostOnly").strip().lower()  # postonly|gtc|ioc
+NETWORK = os.getenv("HYPER_NETWORK", "mainnet").strip().lower()
+BASE_URL = os.getenv("HYPERLIQUID_BASE", "").strip() or None
+PRIVKEY = os.getenv("HYPER_PRIVATE_KEY", "").strip()
 
-@dataclass
-class Plan:
-    coin: str
-    is_buy: bool
-    px: float
-    sz: float
-    tif: str
-    reduce_only: bool = False
+NOTIONAL_USD = float(os.getenv("HYPER_NOTIONAL_USD", "0") or 0)
+FIXED_QTY = float(os.getenv("HYPER_FIXED_QTY", "0") or 0)
+
+# --- Helpers -----------------------------------------------------------------
+def _split_coin(symbol: str) -> str:
+    # "BTC/USD" -> "BTC"
+    return symbol.split("/")[0].strip().upper()
 
 def _mk_clients() -> Tuple[Exchange, Info]:
     """
-    Create Exchange/Info compatible with SDK 0.x.
-    Tries multiple constructor signatures to match installed version.
+    Build Exchange + Info clients using wallet private key.
+    Try a few constructor signatures for SDK compatibility.
     """
-    # Try in order: wallet/agent/private_key/no-arg
-    tried = []
+    if not PRIVKEY:
+        raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
 
-    # Some 0.x builds accept wallet=... or agent=...
-    wallet_kw_names = ("wallet", "agent", "private_key")
-    for kw in wallet_kw_names:
-        if PRIVKEY:
-            try:
-                ex = Exchange(**{kw: PRIVKEY})  # type: ignore[arg-type]
-                info = Info()
-                log.info("[BROKER] Exchange init via %s with HYPER_PRIVATE_KEY=%s", kw, _mask(PRIVKEY))
-                return ex, info
-            except TypeError as e:
-                tried.append(f"{kw}: {e}")
+    # Prefer mainnet default endpoints; allow override via HYPERLIQUID_BASE
+    base_kw = {}
+    if BASE_URL:
+        # Newer SDK uses base_url; some older use exchange-url via env
+        base_kw = {"base_url": BASE_URL}
 
-    # Older builds: api_key/secret (API wallet)
-    if API_KEY and API_SECRET:
+    # Try different constructors the SDK has used across versions
+    last_err = None
+    for ctor in (
+        lambda: Exchange(PRIVKEY, **base_kw),                 # most common
+        lambda: Exchange(private_key=PRIVKEY, **base_kw),     # some builds
+    ):
         try:
-            ex = Exchange(api_key=API_KEY, secret=API_SECRET)  # type: ignore[arg-type]
-            info = Info()
-            log.info("[BROKER] Exchange init via api_key/secret.")
+            ex = ctor()
+            info = Info(**base_kw) if base_kw else Info()
+            log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
+                     PRIVKEY[:6], PRIVKEY[-4:])
             return ex, info
-        except TypeError as e:
-            tried.append(f"api_key: {e}")
+        except Exception as e:
+            last_err = e
+            continue
 
-    # Very old builds: no-arg ctor + global Info()
-    try:
-        ex = Exchange()  # type: ignore[call-arg]
-        info = Info()
-        log.warning("[BROKER] Exchange init with no args (legacy). HYPER_PRIVATE_KEY=%s", _mask(PRIVKEY))
-        return ex, info
-    except Exception as e:
-        tried.append(f"no-arg: {e}")
+    raise RuntimeError(f"Could not initialize Exchange with provided private key: {last_err}")
 
-    raise RuntimeError("Could not construct Exchange with installed SDK; tried -> " + " | ".join(tried))
-
-def _symbol_ok(symbol: str) -> bool:
-    if not ONLY:
-        return True
-    return symbol in ONLY
-
-def _norm_coin(symbol: str) -> str:
-    # "BTC/USD" -> "BTC"
-    return symbol.split("/")[0].upper().strip()
-
-def _tif_key(tif: str) -> str:
-    # Map TIF to wire schema expected by 0.x bulk_orders: {"order_type": {"limit": {"tif": "postOnly"}}}
-    t = tif.lower()
-    if t in ("postonly", "post_only", "post"):
-        return "postOnly"
-    if t in ("gtc",):
-        return "gtc"
-    if t in ("ioc",):
-        return "ioc"
-    if t in ("fok",):
-        return "fok"
-    # default
-    return "postOnly"
-
-def _build_plan(side: str, symbol: str, entry_low: float, entry_high: float, notional_usd: Optional[float],
-                fixed_qty: Optional[float], lev: float, tif: Optional[str]) -> Plan:
-    coin = _norm_coin(symbol)
-    is_buy = side.upper() == "LONG"
-    # midpoint entry
-    px = (float(entry_low) + float(entry_high)) / 2.0
-    # size: prefer fixed_qty coin size; else notional / px
-    if fixed_qty and fixed_qty > 0:
-        sz = float(fixed_qty)
+def _order_type_from_env() -> object:
+    tif_key = DEFAULT_TIF
+    if _ORDER_LIMIT_CLASS:
+        # Use the modern class API
+        if tif_key in ("postonly", "po", "post_only"):
+            return OrderType.Limit(tif=TIF.Po)
+        if tif_key in ("ioc",):
+            return OrderType.Limit(tif=TIF.Ioc)
+        return OrderType.Limit(tif=TIF.Gtc)
     else:
-        dollars = float(notional_usd or 100.0)  # fallback $100 notional if unset
-        sz = (dollars * float(lev)) / px
-    return Plan(coin=coin, is_buy=is_buy, px=px, sz=sz, tif=(tif or DEFAULT_TIF))
+        # Fallback JSON wire format
+        if tif_key in ("postonly", "po", "post_only"):
+            return {"t": "limit", "tif": "Po"}
+        if tif_key in ("ioc",):
+            return {"t": "limit", "tif": "Ioc"}
+        return {"t": "limit", "tif": "Gtc"}
 
+def _size_from_notional(notional_usd: float, px: float) -> float:
+    if px <= 0:
+        return 0.0
+    return max(0.0, round(notional_usd / px, 8))
+
+# --- Public entry -------------------------------------------------------------
 def submit_signal(sig) -> None:
     """
-    Execute an ExecSignal (from execution.py) using SDK 0.x wire format.
-    Expects sig.entry_low, sig.entry_high, sig.symbol, sig.side, sig.stop_loss, etc.
+    Submit a single LIMIT order at the mid of the entry band using HL SDK.
     """
-    symbol = getattr(sig, "symbol")
-    side = getattr(sig, "side")
-    entry_low = getattr(sig, "entry_low", None)
-    entry_high = getattr(sig, "entry_high", None)
-    stop_loss = getattr(sig, "stop_loss", None)
-    lev = float(getattr(sig, "leverage", 1.0))
-    tif = getattr(sig, "tif", DEFAULT_TIF)
-    notional = getattr(sig, "notional_usd", None)
-    fixed_qty = getattr(sig, "fixed_qty", None)
-
-    if not _symbol_ok(symbol):
-        log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol)
+    # Allowed symbols gate
+    allowed = ",".join(ALLOW) if ALLOW else "(all)"
+    log.info("[BROKER] symbol=%s allowed=%s", sig.symbol, allowed)
+    if ALLOW and sig.symbol not in ALLOW:
+        log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", sig.symbol)
         return
-    if entry_low is None or entry_high is None:
+
+    # Extract values
+    coin_name = _split_coin(sig.symbol)          # "BTC"
+    is_buy = sig.side.strip().upper() == "LONG"
+    band_low = float(sig.entry_low)
+    band_high = float(sig.entry_high)
+
+    if not (band_low and band_high):
         raise ValueError("Signal missing entry_band=(low, high).")
 
-    plan = _build_plan(side, symbol, float(entry_low), float(entry_high), notional, fixed_qty, lev, tif)
-    log.info("[BROKER] %s %s band=(%.6f,%.6f) SL=%s lev=%.1f TIF=%s",
-             side, symbol, float(entry_low), float(entry_high), stop_loss, lev, plan.tif)
+    # Mid entry price (float)
+    px_entry = round((band_low + band_high) / 2.0, 8)
+
+    # Determine size: fixed qty (if provided) else notional / price
+    if FIXED_QTY > 0:
+        sz_val = round(FIXED_QTY, 8)
+    elif NOTIONAL_USD > 0:
+        sz_val = _size_from_notional(NOTIONAL_USD, px_entry)
+    else:
+        # Default to tiny sizing so tests can still go through
+        sz_val = 0.0001
+
+    order_type = _order_type_from_env()
+
+    log.info(
+        "[BROKER] %s %s band=(%.6f,%.6f) SL=%.6f lev=%s TIF=%s",
+        "LONG" if is_buy else "SHORT",
+        sig.symbol,
+        band_low, band_high,
+        float(sig.stop_loss),
+        str(getattr(sig, "leverage", "")),
+        DEFAULT_TIF,
+    )
 
     ex, info = _mk_clients()
 
-    # Build legacy 0.x order dict (no OrderType class)
-    tif_wire = _tif_key(plan.tif)
+    # Build order payload with floats (NOT strings)
     order = {
-        "coin": plan.coin,
-        "is_buy": bool(plan.is_buy),
-        "sz": f"{plan.sz:.8f}",
-        "limit_px": f"{plan.px:.8f}",
+        "coin": coin_name,
+        "is_buy": bool(is_buy),
+        "sz": float(sz_val),
+        "limit_px": float(px_entry),
+        "order_type": order_type,
         "reduce_only": False,
-        "order_type": {"limit": {"tif": tif_wire}},
     }
 
-    # Place via bulk_orders (works across 0.x)
+    # Submit with bulk_orders (SDK canonical path)
     try:
-        # builder/cloid omitted; SDK adds them as needed
         resp = ex.bulk_orders([order])
-        log.info("[BROKER] bulk_orders resp: %s", resp)
+        log.info("[BROKER] bulk_orders response: %s", str(resp)[:300])
     except Exception as e:
+        # Surface clean error; this is where the old 'Unknown format code f' happened.
         raise RuntimeError(f"SDK bulk_orders failed: {e}") from e
