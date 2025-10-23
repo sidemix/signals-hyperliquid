@@ -1,54 +1,52 @@
-# execution.py
 import importlib
 import logging
-import os
-import traceback
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Optional
 
 log = logging.getLogger("execution")
-logging.basicConfig(
-    level=os.getenv("LOGLEVEL", "INFO"),
-    format="%(levelname)s:%(name)s:%(message)s",
-)
+log.setLevel(logging.INFO)
+
 
 @dataclass
 class ExecSignal:
-    # required fields
-    side: str                  # "LONG" or "SHORT"
-    symbol: str                # e.g. "BTC/USD"
-    entry_low: float           # lower bound of entry band
-    entry_high: float          # upper bound of entry band
-    stop_loss: float           # absolute stop
-    leverage: float = 0.0      # optional leverage (not required by HL SDK)
-    tf: str = "5m"             # timeframe string (for logging only)
-    tp_count: int = 0          # used only for logging
+    side: str               # "LONG" | "SHORT"
+    symbol: str             # "BTC/USD", etc.
+    entry_low: float        # lower band
+    entry_high: float       # upper band
+    stop_loss: Optional[float] = None
+    leverage: Optional[float] = None
+    tpn: Optional[int] = None
+    timeframe: Optional[str] = None
+    tif: Optional[str] = None  # e.g., "PostOnly" (optional)
 
-def _get_broker_submit() -> Callable[[ExecSignal], None]:
+
+def _get_broker_submit():
     """
-    Lazily import the broker submit function so we can hot-swap brokers.
+    Lazy import so we can reload broker without restarting the bot.
     """
     try:
         mod = importlib.import_module("broker.hyperliquid")
-        return getattr(mod, "submit_signal")
+        submit_fn = getattr(mod, "submit_signal")
+        return submit_fn
     except Exception as e:
+        import traceback
         tb = traceback.format_exc()
         raise RuntimeError(f"Broker import failed:\n{tb}") from e
 
+
 def execute_signal(sig: ExecSignal) -> None:
     """
-    One entry point used by the Discord listener.
+    Accept ExecSignal and forward to broker with logs.
     """
-    submit_fn = _get_broker_submit()
-
-    band_str = f"({sig.entry_low:.6f}, {sig.entry_high:.6f})"
     log.info(
-        "[EXEC] %s %s band=%s SL=%.6f lev=%.6f TF=%s",
-        sig.side, sig.symbol, band_str, sig.stop_loss, sig.leverage, sig.tf,
+        "[EXEC] %s %s band=(%f, %f) SL=%s lev=%s TF=%s",
+        sig.side, sig.symbol, sig.entry_low, sig.entry_high,
+        str(sig.stop_loss), str(sig.leverage), str(sig.timeframe)
     )
 
+    submit_fn = _get_broker_submit()
     try:
         submit_fn(sig)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.error("[EXC] execution error: %s", e)
         raise
