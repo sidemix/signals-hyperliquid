@@ -11,7 +11,7 @@ from hyperliquid.info import Info
 log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
 
-# ---- Environment flags / config ----
+# ---- Config (ENV) ----
 ONLY_EXECUTE = {
     s.strip().upper().replace("USDT", "USD")
     for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",")
@@ -19,29 +19,22 @@ ONLY_EXECUTE = {
 }
 DRY_RUN = os.getenv("HYPER_DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "y"}
 
-API_KEY = os.getenv("HYPER_API_KEY", "").strip() or None
-API_SECRET = os.getenv("HYPER_API_SECRET", "").strip() or None
+# We intentionally DO NOT support API key auth here (your SDK build doesn’t).
+# Use your wallet private key (the address that holds the HL subaccount).
 PRIVKEY = os.getenv("HYPER_PRIVATE_KEY", "").strip() or None
-VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip() or None
 
-# Sizing: default target notional in USD for a single order
+# Sizing & order style
 DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "500"))
-
-# TIF for logs only (SDK dict uses it inside order_type)
-DEFAULT_TIF = os.getenv("HYPER_TIF", "Gtc").strip() or "Gtc"
-POST_ONLY = os.getenv("HYPER_POST_ONLY", "true").strip().lower() in {"1", "true", "yes", "y"}
+DEFAULT_TIF = os.getenv("HYPER_TIF", "PostOnly").strip() or "PostOnly"  # "Gtc" or "PostOnly"
+POST_ONLY = DEFAULT_TIF.lower() == "postonly" or os.getenv("HYPER_POST_ONLY", "true").lower() in {"1", "true", "yes", "y"}
 
 
 def _mk_clients() -> Tuple[Exchange, Info]:
-    if API_KEY and API_SECRET:
-        ex = Exchange(api_key=API_KEY, secret=API_SECRET)
-        info = Info()
-        return ex, info
     if PRIVKEY:
-        ex = Exchange(agent=PRIVKEY)
+        ex = Exchange(agent=PRIVKEY)   # wallet private key auth
         info = Info()
         return ex, info
-    raise RuntimeError("No Hyperliquid credentials found. Set HYPER_API_KEY/SECRET or HYPER_PRIVATE_KEY.")
+    raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
 
 
 def _normalize_symbol(sym: str) -> str:
@@ -52,7 +45,6 @@ def _normalize_symbol(sym: str) -> str:
 
 
 def _coin_from_symbol(symbol: str) -> str:
-    # "BTC/USD" -> "BTC"
     return symbol.split("/")[0].upper()
 
 
@@ -107,24 +99,22 @@ def _size_from_notional(mark_px: float, notional_usd: float) -> float:
 def _build_order_request(sig: Any, info: Info) -> Dict[str, Any]:
     """
     Build an order request dict compatible with Exchange.bulk_orders([...]).
-    This avoids importing OrderType and works across SDK variants.
+    Avoid importing OrderType so it works across SDK variants.
 
-    Expected format per SDK:
+    Expected shape (SDK >= 0.14 typically):
       {
         "coin": "BTC",
         "is_buy": True,
         "sz": "0.001",
         "limit_px": "30000",
-        "order_type": {"limit": {"tif": "Gtc", "post_only": True}},
+        "order_type": {"limit": {"tif": "Gtc" or "PostOnly", "post_only": True/False}},
         "reduce_only": False,
-        # "cloid": "...",  # optional
       }
     """
     symbol = _normalize_symbol(getattr(sig, "symbol", ""))
     is_buy = _is_buy(getattr(sig, "side", ""))
     entry_lo, entry_hi = _get_band(sig)
 
-    # choose price edge: LONG -> lower edge; SHORT -> upper edge
     px = float(entry_lo if is_buy else entry_hi)
 
     mark = _mark_price(info, symbol)
@@ -133,9 +123,10 @@ def _build_order_request(sig: Any, info: Info) -> Dict[str, Any]:
     sz = _size_from_notional(mark, DEFAULT_NOTIONAL)
 
     coin = _coin_from_symbol(symbol)
-    order_type = {"limit": {"tif": DEFAULT_TIF}}
+
+    order_type = {"limit": {"tif": "Gtc"}}
     if POST_ONLY:
-        order_type["limit"]["post_only"] = True
+        order_type = {"limit": {"tif": "PostOnly", "post_only": True}}
 
     req: Dict[str, Any] = {
         "coin": coin,
@@ -152,7 +143,7 @@ def submit_signal(sig: Any) -> None:
     """
     Entry from execution layer.
     """
-    log.info("[BROKER] hyperliquid.py loaded, version=hl-broker-compat-2.1")
+    log.info("[BROKER] hyperliquid.py loaded, version=hl-broker-compat-2.2")
 
     symbol = _normalize_symbol(getattr(sig, "symbol", ""))
     if ONLY_EXECUTE:
@@ -172,7 +163,7 @@ def submit_signal(sig: Any) -> None:
         entry_hi,
         (f"{sl:.6f}" if isinstance(sl, (int, float)) else "None"),
         (f"{lev:.1f}" if isinstance(lev, (int, float)) else "None"),
-        DEFAULT_TIF,
+        ("PostOnly" if POST_ONLY else "Gtc"),
     )
 
     ex, info = _mk_clients()
@@ -185,7 +176,7 @@ def submit_signal(sig: Any) -> None:
         req["coin"],
         req["limit_px"],
         req["sz"],
-        DEFAULT_TIF,
+        ("PostOnly" if POST_ONLY else "Gtc"),
         req.get("reduce_only", False),
     )
 
@@ -196,7 +187,7 @@ def submit_signal(sig: Any) -> None:
             req["coin"],
             req["limit_px"],
             req["sz"],
-            DEFAULT_TIF,
+            ("PostOnly" if POST_ONLY else "Gtc"),
         )
         return
 
