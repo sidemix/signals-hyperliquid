@@ -1,200 +1,208 @@
-"""
-broker/hyperliquid.py
-Lightweight HL broker adapter (SDK >= 0.20.x).
-
-Fixes:
-- Remove import/use of TIF enum (build OrderType.Limit(tif="Gtc") directly)
-- Read entry band via ExecSignal.entry_band instead of band_low/band_high
-"""
-
+# broker/hyperliquid.py
 from __future__ import annotations
 
 import os
-import time
 import logging
-from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
-from hyperliquid.utils.signing import OrderType  # NOTE: no TIF import
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
 
-BROKER_VERSION = "hl-broker-1.2.3"
+# ---- Environment flags / config ----
+ONLY_EXECUTE = {
+    s.strip().upper().replace("USDT", "USD")
+    for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",")
+    if s.strip()
+}
+DRY_RUN = os.getenv("HYPER_DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "y"}
+
+API_KEY = os.getenv("HYPER_API_KEY", "").strip() or None
+API_SECRET = os.getenv("HYPER_API_SECRET", "").strip() or None
+PRIVKEY = os.getenv("HYPER_PRIVATE_KEY", "").strip() or None
+VAULT_ADDRESS = os.getenv("HYPER_VAULT_ADDRESS", "").strip() or None
+
+# Sizing: default target notional in USD for a single order
+DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "500"))
+
+# TIF for logs only (SDK dict uses it inside order_type)
+DEFAULT_TIF = os.getenv("HYPER_TIF", "Gtc").strip() or "Gtc"
+POST_ONLY = os.getenv("HYPER_POST_ONLY", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 
-# --------------------------- env helpers ---------------------------
-
-def _get_env_str(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name, default)
-    return v if (v is not None and str(v).strip() != "") else default
-
-
-def _get_env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = v.strip().lower()
-    return s in ("1", "true", "yes", "on")
+def _mk_clients() -> Tuple[Exchange, Info]:
+    if API_KEY and API_SECRET:
+        ex = Exchange(api_key=API_KEY, secret=API_SECRET)
+        info = Info()
+        return ex, info
+    if PRIVKEY:
+        ex = Exchange(agent=PRIVKEY)
+        info = Info()
+        return ex, info
+    raise RuntimeError("No Hyperliquid credentials found. Set HYPER_API_KEY/SECRET or HYPER_PRIVATE_KEY.")
 
 
-def _csv_set(name: str) -> set[str]:
-    raw = _get_env_str(name, "")
-    if not raw:
-        return set()
-    return {p.strip() for p in raw.split(",") if p.strip()}
-
-
-# --------------------------- config ---------------------------
-
-HYPER_BASE = _get_env_str("HYPERLIQUID_BASE", "https://api.hyperliquid.xyz")
-HYPER_NETWORK = _get_env_str("HYPER_NETWORK", "mainnet")
-HYPER_TIF = _get_env_str("HYPER_TIF", "Gtc") or "Gtc"   # "Gtc" | "Ioc" (string)
-DEFAULT_LEV = float(_get_env_str("HYPER_DEFAULT_LEVERAGE", "20") or "20")
-
-NOTIONAL_USD = _get_env_str("HYPER_NOTIONAL_USD")  # preferred
-FIXED_QTY = _get_env_str("HYPER_FIXED_QTY")        # fallback
-
-ONLY_EXEC = _csv_set("HYPER_ONLY_EXECUTE_SYMBOLS")
-DRY_RUN = _get_env_bool("DRY_RUN", False) or _get_env_bool("HYPER_DRY_RUN", False)
-
-# keys: either use normal wallet privkey or API/agent key (both are standard secp256k1)
-PRIVKEY = _get_env_str("HYPER_AGENT_PRIVATE_KEY") or _get_env_str("HYPER_EVM_PRIVKEY")
-if not PRIVKEY:
-    log.warning("[BROKER] No private key found in HYPER_AGENT_PRIVATE_KEY or HYPER_EVM_PRIVKEY; live orders will fail.")
-
-# clients
-_info: Optional[Info] = None
-_ex: Optional[Exchange] = None
-
-
-def _ensure_clients() -> tuple[Info, Exchange]:
-    global _info, _ex
-    if _info is None:
-        _info = Info(base_url=HYPER_BASE, skip_ws=True)
-    if _ex is None:
-        _ex = Exchange(PRIVKEY, base_url=HYPER_BASE)
-    return _info, _ex
-
-
-# --------------------------- datatypes ---------------------------
-
-@dataclass
-class _Plan:
-    coin: str
-    is_buy: bool
-    sz: float
-    limit_px: float
-    tif: str
-    reduce_only: bool = False
-
-
-# --------------------------- utilities ---------------------------
-
-def _symbol_to_coin(symbol: str) -> str:
-    """
-    "ETH/USD" -> "ETH"
-    """
-    s = symbol.strip().upper()
-    if "/" in s:
-        return s.split("/", 1)[0]
+def _normalize_symbol(sym: str) -> str:
+    s = (sym or "").upper().replace("USDT", "USD")
+    if "/" not in s and s.endswith("USD"):
+        s = s[:-3] + "/USD"
     return s
 
 
-def _mid_of_band(entry_band: Tuple[float, float]) -> float:
-    lo, hi = entry_band
-    return (float(lo) + float(hi)) / 2.0
+def _coin_from_symbol(symbol: str) -> str:
+    # "BTC/USD" -> "BTC"
+    return symbol.split("/")[0].upper()
 
 
-def _decide_size_usd(coin: str, mid_px: float) -> float:
+def _is_buy(side: str) -> bool:
+    s = (side or "").upper()
+    if s in {"LONG", "BUY", "BULL", "OPEN_LONG"}:
+        return True
+    if s in {"SHORT", "SELL", "BEAR", "OPEN_SHORT"}:
+        return False
+    raise ValueError(f"Unknown side: {side!r}")
+
+
+def _get_band(sig: Any) -> Tuple[float, float]:
     """
-    Returns contract size in coin. Prefers notional sizing; falls back to fixed qty.
+    Accept either sig.entry_band (tuple/list) OR explicit sig.entry_low/sig.entry_high.
+    Also tolerates old aliases band_low/band_high or low/high.
     """
-    if NOTIONAL_USD:
-        notional = float(NOTIONAL_USD)
-        if mid_px <= 0:
-            raise RuntimeError("Invalid mid price for sizing")
-        return notional / mid_px
-    if FIXED_QTY:
-        return float(FIXED_QTY)
-    # ultra-conservative fallback
-    return 1.0
+    lo = hi = None
+    if hasattr(sig, "entry_band"):
+        band = getattr(sig, "entry_band")
+        if band and isinstance(band, (tuple, list)) and len(band) >= 2:
+            lo, hi = band[0], band[1]
+
+    if lo is None:
+        lo = getattr(sig, "entry_low", None) or getattr(sig, "band_low", None) or getattr(sig, "low", None)
+    if hi is None:
+        hi = getattr(sig, "entry_high", None) or getattr(sig, "band_high", None) or getattr(sig, "high", None)
+
+    if lo is None or hi is None:
+        raise ValueError("Signal missing entry band; need entry_low/entry_high or entry_band=(low, high).")
+
+    return float(lo), float(hi)
 
 
-def _build_plan(side: str,
-                symbol: str,
-                entry_band: Tuple[float, float],
-                tif: str) -> _Plan:
-    coin = _symbol_to_coin(symbol)
-    is_buy = side.strip().upper() == "LONG"
-    px = _mid_of_band(entry_band)
-    sz = _decide_size_usd(coin, px)
-    return _Plan(coin=coin, is_buy=is_buy, sz=sz, limit_px=px, tif=tif)
+def _mark_price(info: Info, symbol: str) -> Optional[float]:
+    try:
+        mids = info.all_mids()
+        coin = _coin_from_symbol(symbol)
+        px = mids.get(coin)
+        return float(px) if px is not None else None
+    except Exception as e:
+        log.warning("Failed to fetch mark price for %s: %s", symbol, e)
+        return None
 
 
-def _order_type_from_tif(tif: str) -> OrderType:
-    # Build a proper OrderType dynamically (no enum import needed)
-    tif_norm = (tif or "Gtc").strip().capitalize()
-    if tif_norm not in ("Gtc", "Ioc"):
-        tif_norm = "Gtc"
-    return OrderType.Limit(tif=tif_norm)
+def _size_from_notional(mark_px: float, notional_usd: float) -> float:
+    if mark_px <= 0:
+        raise ValueError("Invalid mark price")
+    return max(notional_usd / mark_px, 0.0)
 
 
-# --------------------------- public entry ---------------------------
-
-def submit_signal(sig) -> None:
+def _build_order_request(sig: Any, info: Info) -> Dict[str, Any]:
     """
-    Adapter called by execution.py. Expects a dataclass-like object with at least:
-      - side: "LONG" | "SHORT"
-      - symbol: "ETH/USD", etc.
-      - entry_band: tuple(low, high)
-      - stop_loss: float (best-effort; not set here)
-      - leverage: float (best-effort; not set here)
-    """
-    log.info("[BROKER] hyperliquid.py loaded, version=%s", BROKER_VERSION)
+    Build an order request dict compatible with Exchange.bulk_orders([...]).
+    This avoids importing OrderType and works across SDK variants.
 
-    # Validate symbol allowlist, if provided
-    if ONLY_EXEC:
-        if sig.symbol.upper() not in (s.upper() for s in ONLY_EXEC):
-            log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", sig.symbol)
+    Expected format per SDK:
+      {
+        "coin": "BTC",
+        "is_buy": True,
+        "sz": "0.001",
+        "limit_px": "30000",
+        "order_type": {"limit": {"tif": "Gtc", "post_only": True}},
+        "reduce_only": False,
+        # "cloid": "...",  # optional
+      }
+    """
+    symbol = _normalize_symbol(getattr(sig, "symbol", ""))
+    is_buy = _is_buy(getattr(sig, "side", ""))
+    entry_lo, entry_hi = _get_band(sig)
+
+    # choose price edge: LONG -> lower edge; SHORT -> upper edge
+    px = float(entry_lo if is_buy else entry_hi)
+
+    mark = _mark_price(info, symbol)
+    if mark is None:
+        mark = px
+    sz = _size_from_notional(mark, DEFAULT_NOTIONAL)
+
+    coin = _coin_from_symbol(symbol)
+    order_type = {"limit": {"tif": DEFAULT_TIF}}
+    if POST_ONLY:
+        order_type["limit"]["post_only"] = True
+
+    req: Dict[str, Any] = {
+        "coin": coin,
+        "is_buy": bool(is_buy),
+        "sz": f"{sz:.8f}",
+        "limit_px": f"{px:.8f}",
+        "order_type": order_type,
+        "reduce_only": False,
+    }
+    return req
+
+
+def submit_signal(sig: Any) -> None:
+    """
+    Entry from execution layer.
+    """
+    log.info("[BROKER] hyperliquid.py loaded, version=hl-broker-compat-2.1")
+
+    symbol = _normalize_symbol(getattr(sig, "symbol", ""))
+    if ONLY_EXECUTE:
+        log.info("[BROKER] symbol=%s allowed=%s", symbol, ",".join(sorted(ONLY_EXECUTE)))
+        if symbol not in ONLY_EXECUTE:
+            log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol)
             return
 
-    # Pull band from ExecSignal (use entry_band, do not expect band_low/band_high)
-    entry_band = getattr(sig, "entry_band", None)
-    if not entry_band or not isinstance(entry_band, (tuple, list)) or len(entry_band) != 2:
-        raise ValueError("Signal missing entry_band=(low, high).")
-
-    side = getattr(sig, "side")
-    symbol = getattr(sig, "symbol")
-    tif = _get_env_str("HYPER_TIF", HYPER_TIF) or "Gtc"
-
-    plan = _build_plan(side, symbol, (float(entry_band[0]), float(entry_band[1])), tif)
-
+    entry_lo, entry_hi = _get_band(sig)
+    sl = getattr(sig, "stop_loss", None)
+    lev = getattr(sig, "leverage", None)
     log.info(
-        "[PLAN] side=%s coin=%s px=%.8f sz=%.8f tif=%s reduceOnly=%s",
-        "BUY" if plan.is_buy else "SELL", plan.coin, plan.limit_px, plan.sz, plan.tif, plan.reduce_only
+        "[BROKER] %s %s band=(%.6f,%.6f) SL=%s lev=%s TIF=%s",
+        (getattr(sig, "side", "") or "").upper(),
+        symbol,
+        entry_lo,
+        entry_hi,
+        (f"{sl:.6f}" if isinstance(sl, (int, float)) else "None"),
+        (f"{lev:.1f}" if isinstance(lev, (int, float)) else "None"),
+        DEFAULT_TIF,
+    )
+
+    ex, info = _mk_clients()
+    req = _build_order_request(sig, info)
+
+    # Pretty plan log
+    log.info(
+        "[PLAN] side=%s coin=%s px=%s sz=%s tif=%s reduceOnly=%s",
+        ("BUY" if req["is_buy"] else "SELL"),
+        req["coin"],
+        req["limit_px"],
+        req["sz"],
+        DEFAULT_TIF,
+        req.get("reduce_only", False),
     )
 
     if DRY_RUN:
-        log.info("[DRYRUN] submit LIMIT %s %s px=%.8f sz=%.8f tif=%s",
-                 "BUY" if plan.is_buy else "SELL", plan.coin, plan.limit_px, plan.sz, plan.tif)
+        log.info(
+            "[DRYRUN] submit LIMIT %s %s px=%s sz=%s tif=%s",
+            ("BUY" if req["is_buy"] else "SELL"),
+            req["coin"],
+            req["limit_px"],
+            req["sz"],
+            DEFAULT_TIF,
+        )
         return
 
-    if not PRIVKEY:
-        raise RuntimeError("No private key configured; cannot place live orders. Set HYPER_AGENT_PRIVATE_KEY or HYPER_EVM_PRIVKEY.")
-
-    # clients
-    info, ex = _ensure_clients()
-
-    # Build the SDK payload and place the order using the *positional* signature:
-    #   Exchange.order(name, is_buy, sz, limit_px, order_type, reduce_only=False, cloid=None, builder=None)
-    order_type = _order_type_from_tif(plan.tif)
-
     try:
-        resp = ex.order(plan.coin, plan.is_buy, float(plan.sz), float(plan.limit_px), order_type, plan.reduce_only)
+        resp = ex.bulk_orders([req])
         log.info("[LIVE] order response: %s", resp)
     except Exception as e:
-        log.exception("[ERR] SDK order failed: %s", e)
+        log.exception("Order placement failed: %s", e)
         raise
