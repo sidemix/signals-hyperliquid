@@ -2,6 +2,21 @@ import os
 import logging
 from typing import Dict, Any, Optional, Tuple
 
+# --- add/confirm these imports at the top ---
+from typing import Optional, Tuple, Any
+import os, logging as log
+
+# NEW imports:
+from eth_account import Account
+from eth_account.messages import encode_defunct, SignableMessage
+
+# Try to use SDK’s wallet if present
+try:
+    from hyperliquid.utils.wallet import Wallet  # type: ignore
+    _HAS_SDK_WALLET = True
+except Exception:
+    _HAS_SDK_WALLET = False
+
 # ---------- Logging ----------
 log = logging.getLogger("broker.hyperliquid")
 if not log.handlers:
@@ -61,17 +76,56 @@ def _quantize_attempts() -> Tuple[list[int], list[int]]:
     # Decimals for (price_decimals, size_decimals) to try in order
     return [8, 7, 6, 5, 4, 3, 2], [8, 7, 6, 5, 4, 3, 2]
 
-def _mk_agent_from_privkey(priv: str):
+# --- replace your current _mk_agent_from_privkey + agent class with this ---
+
+def _mk_agent_from_privkey(priv: str) -> Any:
     """
-    Create an agent (object with sign_message) the SDK can use.
-    1) Prefer SDK's Wallet class if present.
-    2) Fall back to an eth-account based minimal agent.
+    Prefer the SDK's Wallet (if available). Otherwise fall back to a minimal
+    eth-account based agent that matches the interface the SDK expects.
     """
-    if _SDK_WALLET_CLS is not None:
-        try:
-            return _SDK_WALLET_CLS(priv)
-        except Exception as e:
-            log.warning("SDK Wallet(...) failed, falling back to eth-account agent: %s", e)
+    if _HAS_SDK_WALLET:
+        return Wallet(priv)  # SDK will call .sign_message()/etc. on this
+    return _EthAccountAgent(priv)
+
+
+class _EthAccountAgent:
+    """
+    Minimal signer compatible with hyperliquid’s Exchange expectations.
+    Handles both str payloads and already-constructed SignableMessage.
+    """
+    def __init__(self, priv: str):
+        self._acct = Account.from_key(priv)
+
+    # The SDK calls this; make it robust to multiple input types.
+    def sign_message(self, msg: Any) -> dict:
+        """
+        Accepts:
+          - str: will be signed as EIP-191 defunct message (same as SDK’s simple path)
+          - bytes: same, by decoding as utf-8
+          - SignableMessage: passed directly to Account.sign_message
+        Returns dict with 'signature' hex (what SDK expects).
+        """
+        if isinstance(msg, SignableMessage):
+            signed = self._acct.sign_message(msg)
+        elif isinstance(msg, (bytes, bytearray)):
+            signed = self._acct.sign_message(encode_defunct(text=msg.decode("utf-8")))
+        elif isinstance(msg, str):
+            signed = self._acct.sign_message(encode_defunct(text=msg))
+        else:
+            # Some SDK builds pass {"message": "..."} or similar — handle gently.
+            try:
+                # Try to stringify sensibly
+                signed = self._acct.sign_message(encode_defunct(text=str(msg)))
+            except Exception as e:
+                raise TypeError(f"Unsupported message type for signing: {type(msg)}") from e
+
+        # SDK expects a dict-like with 'signature' (hex string)
+        return {"signature": signed.signature.hex()}
+
+    # Some SDKs also probe sign_typed_data; provide a safe stub.
+    def sign_typed_data(self, typed_data: dict) -> dict:
+        # If you later need true EIP-712 support, wire it here.
+        raise NotImplementedError("EIP-712 signing not implemented in fallback agent")
 
     # ---- Minimal agent using eth-account ----
     from eth_account import Account
