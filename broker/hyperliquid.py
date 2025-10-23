@@ -1,257 +1,247 @@
-# broker/hyperliquid.py
-import logging
 import os
+import math
+import logging
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Optional, Tuple, Callable
+
+# --- Hyperliquid SDK imports (support multiple SDK layouts) -------------------
+try:
+    # Newer layout
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+except ImportError:  # very old SDKs
+    from hyperliquid import Exchange, Info  # type: ignore
+
+# Wallet wrapper name moved around in different releases
+_Wallet = None
+for _cand in (
+    "hyperliquid.wallet",
+    "hyperliquid.utils.wallet",
+):
+    try:
+        _mod = __import__(_cand, fromlist=["Wallet"])
+        _Wallet = getattr(_mod, "Wallet")
+        break
+    except Exception:
+        pass
+
+if _Wallet is None:
+    raise RuntimeError("Could not locate hyperliquid Wallet class in this SDK build.")
+
+# Constants location also moved across releases; we only need URLs
+_BASE_URLS = {
+    "mainnet": "https://api.hyperliquid.xyz",
+    "testnet": "https://api.hyperliquid-testnet.xyz",
+}
 
 log = logging.getLogger("broker.hyperliquid")
-if not log.handlers:
-    logging.basicConfig(level=logging.INFO)
-log.info("[BROKER] hyperliquid.py loaded")
-
-# ---- HL SDK imports (lazy-compatible) ----
-# We import inside helper(s) to survive older / newer SDK shapes.
-def _import_sdk():
-    """
-    Returns (Exchange, Info, order_request_to_order_wire?) as available.
-    """
-    # Newer SDK location
-    try:
-        from hyperliquid.exchange import Exchange  # type: ignore
-        from hyperliquid.info import Info  # type: ignore
-        return Exchange, Info
-    except Exception:
-        # Older flat import shapes (fallback)
-        from hyperliquid import exchange as _ex  # type: ignore
-        from hyperliquid import info as _info  # type: ignore
-        Exchange = getattr(_ex, "Exchange")
-        Info = getattr(_info, "Info")
-        return Exchange, Info
+log.setLevel(logging.INFO)
 
 
-# ---- Config ----
-DEFAULT_TIF = os.getenv("HYPER_DEFAULT_TIF", "PostOnly")
-BASE_USD = float(os.getenv("HYPER_BASE_USD", "50"))
+# --- Internal helpers ---------------------------------------------------------
 
-_ALLOWED = {
-    s.strip()
-    for s in os.getenv(
-        "HYPER_ONLY_EXECUTE_SYMBOLS",
-        "ETH/USD,BTC/USD,SOL/USD,LINK/USD,BNB/USD,AVAX/USD",
-    ).split(",")
-    if s.strip()
-}
-if "" in _ALLOWED:
-    _ALLOWED.remove("")
+def _env(name: str, default: str | None = None) -> str | None:
+    v = os.environ.get(name, default)
+    if v is not None and isinstance(v, str):
+        v = v.strip()
+    return v
 
 
-def _allowed(symbol: str) -> bool:
-    ok = symbol in _ALLOWED
-    if not ok:
-        log.info(
-            f"[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: {symbol}"
-        )
-    else:
-        log.info(
-            f"[BROKER] symbol={symbol} allowed={','.join(sorted(_ALLOWED))}"
-        )
-    return ok
+def _get_allowed_symbols() -> set[str] | None:
+    csv = _env("HYPER_ONLY_EXECUTE_SYMBOLS")
+    if not csv:
+        return None
+    return {s.strip().upper() for s in csv.split(",") if s.strip()}
 
 
-# ---- Utilities ----
-def _split_symbol(sym: str) -> str:
-    # SDK expects just coin name (e.g., "BTC") instead of "BTC/USD"
-    return sym.split("/")[0].strip().upper()
+def _round8(x: float) -> float:
+    """Round DOWN to 8 dp to avoid float_to_wire rounding error."""
+    q = Decimal(str(x)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    return float(q)
 
 
-def _mid(a: float, b: float) -> float:
-    return (float(a) + float(b)) / 2.0
-
-
-def _dec_round_down(x: float, places: int) -> float:
-    q = Decimal(10) ** -places
-    return float((Decimal(str(x))).quantize(q, rounding=ROUND_DOWN))
-
-
-def _trim_size_for_sdk(sz: float) -> float:
-    """
-    HL signer rejects values that would round at wire step.
-    We progressively reduce precision to avoid (“float_to_wire causes rounding”).
-    """
-    for p in (8, 7, 6, 5, 4):
-        v = _dec_round_down(sz, p)
-        if v > 0:
-            return v
-    return max(1e-8, sz)
-
-
-def _extract_entry_band(sig: Any) -> Tuple[float, float]:
-    """
-    Accept any of:
-      - sig.band_low/sig.band_high
-      - sig.entry_low/sig.entry_high
-      - sig.band == (low, high)
-    """
-    low = getattr(sig, "band_low", None)
-    high = getattr(sig, "band_high", None)
-
-    if low is None or high is None:
-        band = getattr(sig, "band", None)
-        if isinstance(band, (tuple, list)) and len(band) == 2:
-            low, high = band[0], band[1]
-
-    if low is None or high is None:
-        low = getattr(sig, "entry_low", low)
-        high = getattr(sig, "entry_high", high)
-
-    if low is None or high is None:
-        raise ValueError("Signal missing entry_band=(low, high).")
-
-    return float(low), float(high)
-
-
-def _order_dict(coin: str, is_buy: bool, sz: float, px: float, tif: str) -> Dict[str, Any]:
-    """
-    Build a modern SDK-compatible order dict.
-    The SDK (signing.py) expects floats for 'sz' and 'limit_px' and an
-    'order_type' dict with tif.
-    """
-    tif_norm = tif if tif in ("Gtc", "Ioc", "PostOnly") else DEFAULT_TIF
-    return {
-        "coin": coin,
-        "is_buy": bool(is_buy),
-        "sz": float(sz),
-        "limit_px": float(px),
-        "order_type": {"limit": {"tif": tif_norm}},
-        "reduce_only": False,
-    }
-
-
-def _try_bulk_with_rounding(ex: Any, order: Dict[str, Any]) -> Any:
-    """
-    Retry bulk_orders while trimming size precision to avoid float_to_wire rounding errors.
-    """
-    last_err: Optional[Exception] = None
-    base_sz = float(order["sz"])
-    for places in (8, 7, 6, 5, 4):
-        try:
-            safe_sz = _dec_round_down(base_sz, places)
-            if safe_sz <= 0:
-                continue
-            order_mod = dict(order)
-            order_mod["sz"] = safe_sz
-            return ex.bulk_orders([order_mod])
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            continue
-    raise RuntimeError(
-        f"SDK bulk_orders failed after rounding attempts: {last_err}"
-    )
-
-
-def _mk_clients() -> Tuple[Any, Any]:
-    """
-    Instantiate Exchange/Info for multiple SDKs:
-      - best-effort with raw private key (preferred)
-      - finally plain constructors if supported
-    """
-    Exchange, Info = _import_sdk()
-
-    priv = os.getenv("HYPER_PRIVATE_KEY", "").strip()
+def _mk_clients() -> tuple[Exchange, Info, str]:
+    """Create Exchange/Info using wallet private key with SDK compatibility."""
+    priv = _env("HYPER_PRIVATE_KEY")
     if not priv:
-        raise RuntimeError(
-            "No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key)."
-        )
-    if not priv.startswith("0x"):
-        priv = "0x" + priv
+        raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
 
-    # Attempt styles in order (many SDK versions exist in the wild).
-    attempts: Tuple[Tuple[str, Callable[[], Any]], ...] = (
-        ("Exchange(private_key=...)", lambda: Exchange(private_key=priv)),           # newer
-        ("Exchange(priv=...)",         lambda: Exchange(priv=priv)),                 # alt kw
-        ("Exchange(privkey=...)",      lambda: Exchange(privkey=priv)),              # alt kw
-        ("Exchange(address, priv)",    lambda: Exchange("", priv)),                  # positional legacy (host param ignored)
-        ("Exchange()",                 lambda: Exchange()),                          # some forks default to env signer
-    )
+    network = (_env("HYPER_NETWORK") or "mainnet").lower()
+    base_url = _BASE_URLS.get(network, _BASE_URLS["mainnet"])
 
+    # Construct wallet via SDK's Wallet wrapper
+    wallet = _Wallet(priv)
+
+    # Newer SDKs: Exchange(wallet=...), Info(base_url=...)
+    # Older SDKs may accept Exchange(wallet, base_url) positionally.
     ex = None
-    last_err: Optional[Exception] = None
-    for label, ctor in attempts:
+    last_err: Exception | None = None
+    for style in (
+        lambda: Exchange(wallet=wallet, base_url=base_url),
+        lambda: Exchange(wallet),  # positional
+        lambda: Exchange(wallet=wallet),  # without base_url if SDK sets default
+    ):
         try:
-            ex = ctor()
-            log.info(f"[BROKER] Exchange init via private key style: {label}")
+            ex = style()
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
-            continue
+
     if ex is None:
         raise RuntimeError(f"Could not construct Exchange with any style: {last_err}")
 
-    try:
-        info = Info()
-    except Exception:
-        # some SDKs require no Info; create a small shim
-        class _NoInfo:
-            def __getattr__(self, _name):  # pragma: no cover
-                raise AttributeError("Info API not available in this SDK build.")
-        info = _NoInfo()
+    # Info has similar constructor variability
+    info = None
+    last_err = None
+    for style in (
+        lambda: Info(base_url=base_url),
+        lambda: Info(),
+    ):
+        try:
+            info = style()
+            break
+        except Exception as e:
+            last_err = e
 
-    return ex, info
+    if info is None:
+        raise RuntimeError(f"Could not construct Info with any style: {last_err}")
+
+    log.info("[BROKER] hyperliquid.py loaded")
+    return ex, info, base_url
 
 
-# ---- Public entrypoint called by execution.execute_signal() ----
-def submit_signal(sig: Any) -> None:
+@dataclass
+class _Plan:
+    side: str          # "BUY" or "SELL"
+    coin: str          # e.g., "BTC"
+    px: float          # limit price
+    sz: float          # size in coin
+    tif: str           # "PostOnly" or "Gtc"
+    reduceOnly: bool = False
+
+
+def _make_plan(side: str, symbol: str, entry_low: float, entry_high: float, lev: float | None) -> _Plan:
+    # Parse symbol like "BTC/USD" => coin="BTC"
+    coin = symbol.split("/")[0].upper()
+
+    # Mid price of the entry band
+    mid = (float(entry_low) + float(entry_high)) / 2.0
+    px = _round8(mid)
+
+    # Size heuristic:
+    # Use a small fixed notional so tests don't fail for precision. You can set HYPER_NOTIONAL_USD.
+    notional_usd = float(_env("HYPER_NOTIONAL_USD", "50") or "50")
+    # Apply leverage to notional if provided (purely sizing logic, exchange enforces real leverage).
+    if lev and lev > 0:
+        notional_usd *= float(lev)
+
+    sz = _round8(notional_usd / px)
+
+    tif = (_env("HYPER_DEFAULT_TIF") or "PostOnly").strip()
+    tif = "PostOnly" if tif.lower() == "postonly" else "Gtc"
+
+    return _Plan(side=side, coin=coin, px=px, sz=sz, tif=tif)
+
+
+def _order_type_from_tif(tif: str) -> dict:
+    # Use dict form accepted by signing.order_request_to_order_wire
+    # PostOnly => {"postOnly": {}}
+    # Gtc/Ioc etc. => {"limit": {"tif": "Gtc"}}
+    t = tif.strip()
+    if t.lower() == "postonly":
+        return {"postOnly": {}}
+    return {"limit": {"tif": t}}
+
+
+def _build_order(plan: _Plan) -> dict:
+    return {
+        "coin": plan.coin,
+        "is_buy": True if plan.side.upper() in ("BUY", "LONG") else False,
+        "sz": _round8(plan.sz),
+        "limit_px": _round8(plan.px),
+        "order_type": _order_type_from_tif(plan.tif),
+        "reduce_only": bool(plan.reduceOnly),
+        # "cloid": None,  # optional client order id; omit for simplicity
+    }
+
+
+def _try_bulk_with_rounding(ex: Exchange, order: dict) -> dict:
     """
-    Execute a single 'entry' order from a parsed/normalized signal object.
-    Required attributes:
-      sig.side           -> "LONG" or "SHORT"
-      sig.symbol         -> "BTC/USD", ...
-    Any of:
-      (sig.band_low, sig.band_high) OR (sig.entry_low, sig.entry_high) OR sig.band=(low, high)
-
-    Optional:
-      sig.tif            -> "PostOnly"|"Gtc"|"Ioc"  (default: env HYPER_DEFAULT_TIF or PostOnly)
-      sig.base_usd       -> float notional to size position (default: env HYPER_BASE_USD)
-      sig.leverage, sig.stop_loss -> currently logged only (no TP/SL automation in this stub)
+    Try bulk_orders; if wire-rounding trips, back off size by 1e-8 a few times.
     """
-    side = getattr(sig, "side", None)
-    symbol = getattr(sig, "symbol", None)
+    # First, ensure floats (not strings)
+    order["sz"] = float(order["sz"])
+    order["limit_px"] = float(order["limit_px"])
 
-    if not side or not symbol:
-        raise ValueError("Signal missing side and/or symbol.")
-
-    if not _allowed(symbol):
-        return
-
-    band_low, band_high = _extract_entry_band(sig)
-    tif = getattr(sig, "tif", None) or DEFAULT_TIF
-
-    is_buy = str(side).upper() == "LONG"
-    coin = _split_symbol(symbol)
-
-    # Plan mid entry
-    mid = _mid(band_low, band_high)
-    base_usd = float(getattr(sig, "base_usd", BASE_USD))
-    px_safe = max(1e-9, float(mid))
-    raw_sz = base_usd / px_safe
-    sz = _trim_size_for_sdk(raw_sz)
-
-    log.info(
-        f"[BROKER] {side} {symbol} band=({band_low:.6f},{band_high:.6f}) "
-        f"SL={getattr(sig, 'stop_loss', None)} lev={getattr(sig, 'leverage', None)} TIF={tif}"
-    )
-    log.info(
-        f"[BROKER] PLAN side={'BUY' if is_buy else 'SELL'} coin={coin} "
-        f"px={float(mid):.8f} sz={sz} tif={tif} reduceOnly=False"
-    )
-
-    order = _order_dict(coin=coin, is_buy=is_buy, sz=sz, px=mid, tif=tif)
-
-    ex, _info = _mk_clients()
-
+    # Primary attempt
     try:
-        resp = _try_bulk_with_rounding(ex, order)
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"SDK bulk_orders failed: {e}") from e
+        return ex.bulk_orders([order])
+    except Exception as e:
+        last_err = e
 
-    log.info(f"[BROKER] order response: {resp}")
+    # Backoff attempts on size only, up to 5 times
+    step = 1e-8
+    for _ in range(5):
+        new_sz = max(0.0, float(order["sz"]) - step)
+        # If size hits zero, bail
+        if new_sz <= 0.0:
+            break
+        order["sz"] = _round8(new_sz)
+        try:
+            return ex.bulk_orders([order])
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
+
+
+# --- Public submit function (called by execution.py) --------------------------
+
+def submit_signal(sig) -> None:
+    """
+    Expected attributes on `sig`:
+      - side: "LONG"/"SHORT" (or "BUY"/"SELL")
+      - symbol: like "BTC/USD"
+      - entry_low, entry_high: floats
+      - stop_loss: float (parsed but not used in this simple example)
+      - lev: float or None
+      - tif: optional, env overrides anyway
+    """
+    # Validate entry band present
+    if getattr(sig, "entry_low", None) is None or getattr(sig, "entry_high", None) is None:
+        raise ValueError("Signal missing entry_band=(low, high).")
+
+    side = str(getattr(sig, "side")).upper()
+    if side.startswith("LONG") or side.startswith("BUY"):
+        side_norm = "BUY"
+    elif side.startswith("SHORT") or side.startswith("SELL"):
+        side_norm = "SELL"
+    else:
+        raise ValueError(f"Unsupported side: {getattr(sig, 'side')}")
+
+    symbol = str(getattr(sig, "symbol"))
+    allowed = _get_allowed_symbols()
+    if allowed is not None:
+        if symbol.upper() not in allowed:
+            log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol)
+            return
+
+    entry_low = float(getattr(sig, "entry_low"))
+    entry_high = float(getattr(sig, "entry_high"))
+    sl = getattr(sig, "stop_loss", None)  # parsed but not enforced in this minimal example
+    lev = getattr(sig, "lev", None)
+
+    ex, _info, _base = _mk_clients()
+
+    # Plan + log
+    plan = _make_plan(side_norm, symbol, entry_low, entry_high, lev)
+    log.info("[BROKER] %s %s band=(%f,%f) SL=%s lev=%s TIF=%s",
+             side_norm, symbol, entry_low, entry_high, str(sl), str(lev), plan.tif)
+    log.info("[BROKER] PLAN side=%s coin=%s px=%0.8f sz=%0.8f tif=%s reduceOnly=%s",
+             plan.side, plan.coin, plan.px, plan.sz, plan.tif, plan.reduceOnly)
+
+    order = _build_order(plan)
+
+    # Place order
+    resp = _try_bulk_with_rounding(ex, order)
+    log.info("[BROKER] bulk_orders OK: %s", resp)
