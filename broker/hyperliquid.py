@@ -1,110 +1,68 @@
+# broker/hyperliquid.py
+from __future__ import annotations
+
 import os
-import logging
-from typing import Dict, Any, Optional, Tuple
+import logging as log
+from typing import Any, Dict, List, Optional, Tuple
 
-# --- add/confirm these imports at the top ---
-from typing import Optional, Tuple, Any
-import os, logging as log
+# SDK imports (prefer these modules; older "from hyperliquid import Exchange" fails)
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
 
-# NEW imports:
-from eth_account import Account
-from eth_account.messages import encode_defunct, SignableMessage
-
-# Try to use SDK’s wallet if present
+# Use SDK Wallet if present
 try:
     from hyperliquid.utils.wallet import Wallet  # type: ignore
     _HAS_SDK_WALLET = True
 except Exception:
     _HAS_SDK_WALLET = False
 
-# ---------- Logging ----------
-log = logging.getLogger("broker.hyperliquid")
-if not log.handlers:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-# ---------- SDK imports (robust across versions) ----------
-# Exchange / Info live on submodules in recent SDKs.
-try:
-    from hyperliquid.exchange import Exchange  # type: ignore
-    from hyperliquid.info import Info          # type: ignore
-except Exception as e:  # pragma: no cover
-    raise ImportError(
-        "Could not import hyperliquid SDK (exchange/info). "
-        "Make sure 'hyperliquid-python-sdk' is installed."
-    ) from e
-
-# Try wallet/signer classes across SDK variants; if none exist we'll build our own with eth-account
-_SDK_WALLET_CLS = None
-for cand in (
-    "hyperliquid.utils.wallet",
-    "hyperliquid.wallet",
-    "hyperliquid.utils.signing",  # some older builds exposed a signer here
-):
-    try:
-        mod = __import__(cand, fromlist=["Wallet"])
-        if hasattr(mod, "Wallet"):
-            _SDK_WALLET_CLS = getattr(mod, "Wallet")
-            break
-    except Exception:
-        pass
+# Local signing fallback
+from eth_account import Account
+from eth_account.messages import encode_defunct, SignableMessage
 
 # ---------- Environment ----------
-USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "50"))
-DEFAULT_TIF   = os.getenv("HYPER_TIF", "PostOnly")  # "PostOnly" or "Gtc"
+PRIVKEY = os.getenv("HYPER_PRIVATE_KEY") or ""
+ALLOWED = [s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()]
+DEFAULT_TIF = (os.getenv("HYPER_DEFAULT_TIF") or "PostOnly").strip()
+BASE_USD = float(os.getenv("HYPER_BASE_USD") or "50.0")  # default sizing if you don't pass one
 
-ALLOWED = [s.strip().upper() for s in os.getenv(
-    "HYPER_ONLY_EXECUTE_SYMBOLS",
-    "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,"
-    "PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
-).split(",") if s.strip()]
+if not PRIVKEY:
+    # We'll raise a clear error later if you try to submit without a key
+    log.info("[BROKER] No HYPER_PRIVATE_KEY present yet.")
 
-BASE_URL = os.getenv("HYPER_BASE_URL")  # optional, SDK typically defaults correctly
-WS_URL   = os.getenv("HYPER_WS_URL")    # optional
+log.info("[BROKER] hyperliquid.py loaded")
 
 # ---------- Helpers ----------
-def _symbol_to_coin(symbol: str) -> str:
-    # "BTC/USD" -> "BTC"
-    if "/" in symbol:
-        return symbol.split("/")[0].strip().upper()
-    return symbol.strip().upper()
 
-def _choose_px(entry_low: float, entry_high: float, side: str) -> float:
-    # Use inner edge of the band consistent with side
-    return float(entry_low if str(side).upper() == "LONG" else entry_high)
-
-def _quantize_attempts() -> Tuple[list[int], list[int]]:
-    # Decimals for (price_decimals, size_decimals) to try in order
-    return [8, 7, 6, 5, 4, 3, 2], [8, 7, 6, 5, 4, 3, 2]
-
-# --- replace your current _mk_agent_from_privkey + agent class with this ---
+def _split_symbol(symbol: str) -> str:
+    """Convert 'BTC/USD' -> 'BTC' (coin name used by SDK Info.name_to_asset)."""
+    if not symbol:
+        return symbol
+    s = symbol.upper().strip()
+    if "/" in s:
+        return s.split("/")[0]
+    return s
 
 def _mk_agent_from_privkey(priv: str) -> Any:
     """
-    Prefer the SDK's Wallet (if available). Otherwise fall back to a minimal
-    eth-account based agent that matches the interface the SDK expects.
+    Prefer the SDK's Wallet; otherwise fall back to minimal eth-account agent
+    that matches the interface the SDK expects.
     """
     if _HAS_SDK_WALLET:
-        return Wallet(priv)  # SDK will call .sign_message()/etc. on this
+        return Wallet(priv)
     return _EthAccountAgent(priv)
 
 
 class _EthAccountAgent:
     """
     Minimal signer compatible with hyperliquid’s Exchange expectations.
-    Handles both str payloads and already-constructed SignableMessage.
+    Handles str, bytes, and SignableMessage correctly.
     """
     def __init__(self, priv: str):
         self._acct = Account.from_key(priv)
 
-    # The SDK calls this; make it robust to multiple input types.
-    def sign_message(self, msg: Any) -> dict:
-        """
-        Accepts:
-          - str: will be signed as EIP-191 defunct message (same as SDK’s simple path)
-          - bytes: same, by decoding as utf-8
-          - SignableMessage: passed directly to Account.sign_message
-        Returns dict with 'signature' hex (what SDK expects).
-        """
+    def sign_message(self, msg: Any) -> Dict[str, str]:
+        # SDK sometimes passes an already-built SignableMessage
         if isinstance(msg, SignableMessage):
             signed = self._acct.sign_message(msg)
         elif isinstance(msg, (bytes, bytearray)):
@@ -112,214 +70,160 @@ class _EthAccountAgent:
         elif isinstance(msg, str):
             signed = self._acct.sign_message(encode_defunct(text=msg))
         else:
-            # Some SDK builds pass {"message": "..."} or similar — handle gently.
-            try:
-                # Try to stringify sensibly
-                signed = self._acct.sign_message(encode_defunct(text=str(msg)))
-            except Exception as e:
-                raise TypeError(f"Unsupported message type for signing: {type(msg)}") from e
-
-        # SDK expects a dict-like with 'signature' (hex string)
+            # Fallback: stringify
+            signed = self._acct.sign_message(encode_defunct(text=str(msg)))
         return {"signature": signed.signature.hex()}
 
-    # Some SDKs also probe sign_typed_data; provide a safe stub.
+    # If the SDK ever calls this we can implement EIP-712 later
     def sign_typed_data(self, typed_data: dict) -> dict:
-        # If you later need true EIP-712 support, wire it here.
         raise NotImplementedError("EIP-712 signing not implemented in fallback agent")
 
-    # ---- Minimal agent using eth-account ----
-    from eth_account import Account
-    from eth_account.messages import encode_defunct
-
-    class _EthAccountAgent:
-        def __init__(self, pk: str):
-            # Account.from_key accepts hex string with or without 0x
-            self._acct = Account.from_key(pk)
-
-        # hyperliquid SDK calls agent.sign_message(message_str)
-        def sign_message(self, message: str) -> str:
-            msg = encode_defunct(text=message)
-            sig = self._acct.sign_message(msg)
-            # SDK generally accepts hex signature
-            return sig.signature.hex()
-
-        # Some SDKs also read address property
-        @property
-        def address(self) -> str:
-            return self._acct.address
-
-    return _EthAccountAgent(priv)
-
 def _mk_clients() -> Tuple[Exchange, Info]:
-    # Wallet private key auth (required)
-    priv = os.getenv("HYPER_PRIVATE_KEY", "").strip()
-    if not priv:
+    if not PRIVKEY:
         raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
-
-    agent = _mk_agent_from_privkey(priv)
-
-    ex: Optional[Exchange] = None
-    init_errors = []
-
-    # Try common constructor styles
-
-    # (a) keyword args
-    try:
-        kwargs = {"agent": agent}
-        if BASE_URL:
-            kwargs["base_url"] = BASE_URL
-        if WS_URL:
-            kwargs["websocket_url"] = WS_URL
-        ex = Exchange(**kwargs)  # type: ignore[arg-type]
-    except Exception as e:
-        init_errors.append(f"agent-kwargs: {e}")
-
-    # (b) positional agent
-    if ex is None:
-        try:
-            ex = Exchange(agent)  # type: ignore[misc]
-        except Exception as e:
-            init_errors.append(f"agent-positional: {e}")
-
-    # (c) very old builds: positional privkey
-    if ex is None:
-        try:
-            ex = Exchange(priv)  # type: ignore[misc]
-        except Exception as e:
-            init_errors.append(f"privkey-positional: {e}")
-
-    if ex is None:
-        raise RuntimeError("Failed to initialize Exchange with provided private key. "
-                           f"Attempts: {', '.join(init_errors)}")
-
-    # --- IMPORTANT ---
-    # Some SDK builds don't keep the agent we pass. Make sure ex.agent is our signer.
-    try:  # <<< NEW >>>
-        setattr(ex, "agent", agent)      # force the correct agent onto the Exchange  <<< NEW >>>
-    except Exception:
-        pass                              # <<< NEW >>>
-
-    # Optional: log what we ended up with (helps confirm)
-    try:  # <<< NEW >>>
-        atype = type(getattr(ex, "agent", None)).__name__
-        log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s (agent=%s)",
-                 priv[:6], priv[-4:], atype)
-    except Exception:
-        log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
-                 priv[:6], priv[-4:])
-
-    # Info client
-    try:
-        info = Info(base_url=BASE_URL) if BASE_URL else Info()
-    except TypeError:
-        info = Info()
-
+    agent = _mk_agent_from_privkey(PRIVKEY)
+    ex = Exchange(agent=agent)  # wallet auth path; compat across SDK versions
+    info = Info()
+    log.info(f"[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY={PRIVKEY[:6]}…{PRIVKEY[-4:]} "
+             f"(agent={'Wallet' if _HAS_SDK_WALLET else '_EthAccountAgent'})")
     return ex, info
 
+def _allowed(symbol: str) -> bool:
+    if not ALLOWED:
+        return True
+    return symbol.upper() in ALLOWED
 
-def _build_order_dict(coin: str, is_buy: bool, sz: float, limit_px: float, tif: str) -> Dict[str, Any]:
-    # Dictionary format expected by Exchange.bulk_orders([...])
-    tif_norm = "PostOnly" if str(tif) == "PostOnly" else "Gtc"
+def _mid(a: float, b: float) -> float:
+    return (float(a) + float(b)) / 2.0
+
+def _trim_size_for_sdk(sz: float, max_iters: int = 6) -> float:
+    """
+    Reduce precision to avoid 'float_to_wire causes rounding'.
+    Tries 6,5,4,... decimals. Returns the first that likely passes.
+    """
+    s = sz
+    for decimals in range(6, -1, -1):
+        s_rounded = float(f"{s:.{decimals}f}")
+        if s_rounded > 0:
+            return s_rounded
+    return max(s, 0.0)
+
+def _post_only_order_dict(coin: str, is_buy: bool, sz: float, px: float, tif: str) -> dict:
+    """
+    Build an order dict that the SDK's bulk_orders -> signing.order_request_to_order_wire accepts.
+    Avoids importing OrderType enums (which vary by SDK version).
+    """
+    tif_norm = tif.strip().lower()
+    if tif_norm in ("postonly", "post_only", "post-only"):
+        order_type = {"limit": {"tif": "PostOnly"}}
+    elif tif_norm in ("gtc", "goodtillcancel", "good_till_cancel"):
+        order_type = {"limit": {"tif": "Gtc"}}
+    elif tif_norm in ("ioc", "immediateorcancel", "immediate_or_cancel"):
+        order_type = {"limit": {"tif": "Ioc"}}
+    else:
+        order_type = {"limit": {"tif": "PostOnly"}}
+
     return {
-        "coin": coin,                    # name (not asset id)
+        "coin": coin,          # e.g., "BTC"
         "is_buy": bool(is_buy),
-        "sz": float(sz),                 # must match coin step
-        "limit_px": float(limit_px),     # must match price tick
-        "order_type": {"limit": {"tif": tif_norm}},  # e.g., "PostOnly" or "Gtc"
+        "sz": float(sz),
+        "limit_px": float(px),
+        "order_type": order_type,
         "reduce_only": False,
-        "cloid": None,
     }
 
-def _try_bulk_with_rounding(ex: Exchange, order: Dict[str, Any]) -> Any:
+def _try_bulk_with_rounding(ex: Exchange, order: dict) -> Any:
     """
-    Retry bulk_orders by progressively reducing precision on sz/limit_px
-    until SDK accepts (avoids `float_to_wire causes rounding`).
+    Calls bulk_orders; if we hit float_to_wire rounding on size, trim and retry; if on price,
+    nudge price by a minimal tick (1e-6) and retry. Also tolerates the SDK passing different
+    signable message types to our agent.
     """
-    px_attempts, sz_attempts = _quantize_attempts()
     last_err: Optional[Exception] = None
-
-    for pd in px_attempts:
-        for sd in sz_attempts:
-            try:
-                order_try = dict(order)
-                order_try["limit_px"] = float(round(order["limit_px"], pd))
-                order_try["sz"] = float(round(order["sz"], sd))
-                if order_try["sz"] <= 0:
-                    continue
-                return ex.bulk_orders([order_try])
-            except Exception as e:
-                last_err = e
-
-    # One last coarse attempt at 1–3 decimals for price & 3–5 for size
-    for pd in (3, 2, 1):
-        for sd in (5, 4, 3):
-            try:
-                order_try = dict(order)
-                order_try["limit_px"] = float(round(order["limit_px"], pd))
-                order_try["sz"] = float(round(order["sz"], sd))
-                if order_try["sz"] <= 0:
-                    continue
-                return ex.bulk_orders([order_try])
-            except Exception as e:
-                last_err = e
-
+    # Up to a handful of attempts adjusting size/price minimal amounts
+    sz = float(order["sz"])
+    px = float(order["limit_px"])
+    for _ in range(8):
+        order["sz"] = _trim_size_for_sdk(sz)
+        order["limit_px"] = float(f"{px:.8f}")  # cap to 8 dp to help the SDK round trip
+        try:
+            return ex.bulk_orders([order])
+        except Exception as e:
+            msg = str(e)
+            last_err = e
+            if "float_to_wire causes rounding" in msg:
+                # If it's on sz: shrink a bit more; if on p: nudge price by tiny amount away from midpoint
+                if "'s':" in msg or " 's'" in msg:
+                    sz = max(sz - sz * 0.1, sz * 0.9)
+                elif "'p':" in msg or " 'p'" in msg:
+                    # Nudge by one minimal tick
+                    px = px * 0.999999
+                else:
+                    sz = _trim_size_for_sdk(sz)
+            elif "SignableMessage" in msg or "encode" in msg:
+                # Our agent handles this; continue to let it retry in case SDK re-wraps message.
+                pass
+            else:
+                # Any other error -> break and bubble up
+                break
     raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
 
-# ---------- Public entry ----------
-def submit_signal(sig) -> None:
-    """
-    Expected fields on `sig` (ExecSignal):
-      - side: "LONG" or "SHORT"
-      - symbol: like "BTC/USD"
-      - entry_low, entry_high: floats
-      - stop_loss: Optional[float]
-      - leverage: Optional[float]
-      - tpn: Optional[int]
-      - timeframe: Optional[str]
-      - tif: Optional[str]
-    """
-    side = str(getattr(sig, "side")).upper()
-    symbol = str(getattr(sig, "symbol")).upper()
+# ---------- Public entry point ----------
 
-    tif = getattr(sig, "tif", None) or DEFAULT_TIF
-    if tif not in ("PostOnly", "Gtc"):
-        tif = DEFAULT_TIF
+def submit_signal(sig: Any) -> None:
+    """
+    Accepts an ExecSignal-like object with attributes:
+      - side: 'LONG' or 'SHORT'
+      - symbol: like 'BTC/USD'
+      - band_low, band_high (floats)
+      - stop_loss (float)  [optional for this simple entry, not used here]
+      - leverage (float)   [optional; not used for sizing here]
+      - tif (optional str) [PostOnly/Gtc/Ioc]
+      - base_usd (optional float) notional to size from; default BASE_USD
+    """
+    symbol = getattr(sig, "symbol")
+    side = getattr(sig, "side")
+    if not symbol or not side:
+        raise ValueError("Signal missing side and/or symbol.")
 
-    if ALLOWED and symbol not in ALLOWED:
-        log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol)
+    if not _allowed(symbol):
+        log.info(f"[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: {symbol}")
         return
 
-    entry_low = float(getattr(sig, "entry_low"))
-    entry_high = float(getattr(sig, "entry_high"))
-    is_buy = True if side == "LONG" else False
-    coin = _symbol_to_coin(symbol)
-    px = _choose_px(entry_low, entry_high, side)
+    band_low = getattr(sig, "band_low", None)
+    band_high = getattr(sig, "band_high", None)
+    if band_low is None or band_high is None:
+        raise ValueError("Signal missing entry_band=(low, high).")
+
+    tif = getattr(sig, "tif", None) or DEFAULT_TIF
 
     ex, info = _mk_clients()
 
-    # Compute size ~ USD_PER_TRADE / price
-    if px <= 0:
-        raise RuntimeError("Invalid entry price computed for order size.")
-    sz = USD_PER_TRADE / px
+    coin = _split_symbol(symbol)
+    is_buy = str(side).upper() == "LONG"
 
-    order = _build_order_dict(coin=coin, is_buy=is_buy, sz=sz, limit_px=px, tif=tif)
+    # Mid price entry
+    px = _mid(float(band_low), float(band_high))
 
-    log.info(
-        "[BROKER] %s %s band=(%f,%f) SL=%s lev=%s TIF=%s",
-        side, symbol, entry_low, entry_high,
-        str(getattr(sig, "stop_loss", None)),
-        str(getattr(sig, "leverage", None)),
-        tif,
-    )
+    # Basic sizing: use BASE_USD notional unless a base_usd override is carried in sig.
+    notional = float(getattr(sig, "base_usd", BASE_USD))
+    # Guard for zero price
+    px_safe = max(float(px), 1e-9)
+    raw_sz = notional / px_safe
 
-    # Plan log (mid-band px for visibility only)
-    mid_px = (entry_low + entry_high) / 2.0
-    sz_preview = USD_PER_TRADE / max(px, 1e-9)
-    log.info("[PLAN] side=%s coin=%s px=%0.8f sz=%s tif=%s reduceOnly=False",
-             "BUY" if is_buy else "SELL", coin, mid_px, f"{sz_preview:.8f}", tif)
+    # Trim to avoid wire rounding issues
+    sz = _trim_size_for_sdk(raw_sz)
 
+    order = _post_only_order_dict(coin=coin, is_buy=is_buy, sz=sz, px=px, tif=tif)
+
+    log.info(f"[BROKER] {side} {symbol} band=({float(band_low):.6f},{float(band_high):.6f}) "
+             f"SL={getattr(sig, 'stop_loss', None)} lev={getattr(sig, 'leverage', None)} TIF={tif}")
+    log.info(f"[BROKER] PLAN side={'BUY' if is_buy else 'SELL'} coin={coin} "
+             f"px={float(px):.8f} sz={sz} tif={tif} reduceOnly=False")
+
+    # Place the order, coping with SDK float/signing quirks
     try:
         resp = _try_bulk_with_rounding(ex, order)
-        log.info("[BROKER] bulk_orders response: %s", str(resp))
     except Exception as e:
         raise RuntimeError(f"SDK bulk_orders failed: {e}") from e
+
+    log.info(f"[BROKER] order response: {resp}")
