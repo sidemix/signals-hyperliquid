@@ -2,18 +2,36 @@ import os
 import logging
 from typing import Dict, Any, Optional, Tuple
 
-# --- Correct, SDK-compatible imports ---
+# ---------- Logging ----------
+log = logging.getLogger("broker.hyperliquid")
+if not log.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+# ---------- SDK imports (robust across versions) ----------
+# Exchange / Info live on submodules in recent SDKs.
 try:
-    # Most recent SDKs expose these on submodules:
-    from hyperliquid.exchange import Exchange
-    from hyperliquid.info import Info
-except Exception:
-    # Fallback (older/variant installs). If this fails too, the import error will surface.
     from hyperliquid.exchange import Exchange  # type: ignore
     from hyperliquid.info import Info          # type: ignore
+except Exception as e:  # pragma: no cover
+    raise ImportError(
+        "Could not import hyperliquid SDK (exchange/info). "
+        "Make sure 'hyperliquid-python-sdk' is installed."
+    ) from e
 
-log = logging.getLogger("broker.hyperliquid")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# Try wallet/signer classes across SDK variants; if none exist we'll build our own with eth-account
+_SDK_WALLET_CLS = None
+for cand in (
+    "hyperliquid.utils.wallet",
+    "hyperliquid.wallet",
+    "hyperliquid.utils.signing",  # some older builds exposed a signer here
+):
+    try:
+        mod = __import__(cand, fromlist=["Wallet"])
+        if hasattr(mod, "Wallet"):
+            _SDK_WALLET_CLS = getattr(mod, "Wallet")
+            break
+    except Exception:
+        pass
 
 # ---------- Environment ----------
 USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "50"))
@@ -21,8 +39,12 @@ DEFAULT_TIF   = os.getenv("HYPER_TIF", "PostOnly")  # "PostOnly" or "Gtc"
 
 ALLOWED = [s.strip().upper() for s in os.getenv(
     "HYPER_ONLY_EXECUTE_SYMBOLS",
-    "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
+    "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,"
+    "PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
 ).split(",") if s.strip()]
+
+BASE_URL = os.getenv("HYPER_BASE_URL")  # optional, SDK typically defaults correctly
+WS_URL   = os.getenv("HYPER_WS_URL")    # optional
 
 # ---------- Helpers ----------
 def _symbol_to_coin(symbol: str) -> str:
@@ -33,43 +55,114 @@ def _symbol_to_coin(symbol: str) -> str:
 
 def _choose_px(entry_low: float, entry_high: float, side: str) -> float:
     # Use inner edge of the band consistent with side
-    if side.upper() == "LONG":
-        return float(entry_low)
-    return float(entry_high)
+    return float(entry_low if str(side).upper() == "LONG" else entry_high)
 
 def _quantize_attempts() -> Tuple[list[int], list[int]]:
     # Decimals for (price_decimals, size_decimals) to try in order
-    px_try = [8, 7, 6, 5, 4, 3, 2]
-    sz_try = [8, 7, 6, 5, 4, 3, 2]
-    return px_try, sz_try
+    return [8, 7, 6, 5, 4, 3, 2], [8, 7, 6, 5, 4, 3, 2]
+
+def _mk_agent_from_privkey(priv: str):
+    """
+    Create an agent (object with sign_message) the SDK can use.
+    1) Prefer SDK's Wallet class if present.
+    2) Fall back to an eth-account based minimal agent.
+    """
+    if _SDK_WALLET_CLS is not None:
+        try:
+            return _SDK_WALLET_CLS(priv)
+        except Exception as e:
+            log.warning("SDK Wallet(...) failed, falling back to eth-account agent: %s", e)
+
+    # ---- Minimal agent using eth-account ----
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+
+    class _EthAccountAgent:
+        def __init__(self, pk: str):
+            # Account.from_key accepts hex string with or without 0x
+            self._acct = Account.from_key(pk)
+
+        # hyperliquid SDK calls agent.sign_message(message_str)
+        def sign_message(self, message: str) -> str:
+            msg = encode_defunct(text=message)
+            sig = self._acct.sign_message(msg)
+            # SDK generally accepts hex signature
+            return sig.signature.hex()
+
+        # Some SDKs also read address property
+        @property
+        def address(self) -> str:
+            return self._acct.address
+
+    return _EthAccountAgent(priv)
 
 def _mk_clients() -> Tuple[Exchange, Info]:
-    # Wallet private key auth (recommended)
+    # Wallet private key auth (required)
     priv = os.getenv("HYPER_PRIVATE_KEY", "").strip()
     if not priv:
         raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
 
-    # Current SDK constructor takes the private key as a positional arg
-    try:
-        ex = Exchange(priv)
-        log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
-                 priv[:6], priv[-4:])
-    except TypeError as e:
-        raise RuntimeError(
-            "Your installed hyperliquid SDK build doesn’t accept private-key positional init."
-        ) from e
+    agent = _mk_agent_from_privkey(priv)
 
-    info = Info()
+    # SDK constructor signatures vary; try the common patterns.
+    ex: Optional[Exchange] = None
+    init_errors = []
+
+    # (a) Exchange(agent=..., base_url=..., websocket_url=...)
+    try:
+        kwargs = {"agent": agent}
+        if BASE_URL:
+            kwargs["base_url"] = BASE_URL
+        if WS_URL:
+            kwargs["websocket_url"] = WS_URL
+        ex = Exchange(**kwargs)  # type: ignore[arg-type]
+    except TypeError as e:
+        init_errors.append(f"agent-kwargs: {e}")
+
+    # (b) Exchange(agent) positional
+    if ex is None:
+        try:
+            ex = Exchange(agent)  # type: ignore[misc]
+        except Exception as e:
+            init_errors.append(f"agent-positional: {e}")
+
+    # (c) Some very old builds took private key directly (positional). Last resort.
+    if ex is None:
+        try:
+            ex = Exchange(priv)  # type: ignore[misc]
+        except Exception as e:
+            init_errors.append(f"privkey-positional: {e}")
+
+    if ex is None:
+        raise RuntimeError("Failed to initialize Exchange with provided private key. "
+                           f"Attempts: {', '.join(init_errors)}")
+
+    # Info may take base_url kwargs in some builds; attempt kwargs then default
+    info: Optional[Info] = None
+    try:
+        if BASE_URL:
+            info = Info(base_url=BASE_URL)  # type: ignore[call-arg]
+        else:
+            info = Info()
+    except TypeError:
+        info = Info()
+
+    # Redact private key in logs
+    log.info(
+        "[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
+        priv[:6], priv[-4:]
+    )
     return ex, info
 
 def _build_order_dict(coin: str, is_buy: bool, sz: float, limit_px: float, tif: str) -> Dict[str, Any]:
     # Dictionary format expected by Exchange.bulk_orders([...])
+    tif_norm = "PostOnly" if str(tif) == "PostOnly" else "Gtc"
     return {
-        "coin": coin,                # name (not asset id)
+        "coin": coin,                    # name (not asset id)
         "is_buy": bool(is_buy),
-        "sz": float(sz),             # must match coin step
-        "limit_px": float(limit_px), # must match price tick
-        "order_type": {"limit": {"tif": tif}},  # e.g., "PostOnly" or "Gtc"
+        "sz": float(sz),                 # must match coin step
+        "limit_px": float(limit_px),     # must match price tick
+        "order_type": {"limit": {"tif": tif_norm}},  # e.g., "PostOnly" or "Gtc"
         "reduce_only": False,
         "cloid": None,
     }
@@ -142,10 +235,9 @@ def submit_signal(sig) -> None:
     ex, info = _mk_clients()
 
     # Compute size ~ USD_PER_TRADE / price
-    try:
-        sz = USD_PER_TRADE / float(px)
-    except Exception:
+    if px <= 0:
         raise RuntimeError("Invalid entry price computed for order size.")
+    sz = USD_PER_TRADE / px
 
     order = _build_order_dict(coin=coin, is_buy=is_buy, sz=sz, limit_px=px, tif=tif)
 
