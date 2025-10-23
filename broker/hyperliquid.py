@@ -1,208 +1,163 @@
-import logging
 import os
-from dataclasses import dataclass
-from enum import Enum
-from typing import Optional, Tuple
+import logging
+from typing import Dict, Any, Optional, Tuple
 
-# Hyperliquid SDK
-from hyperliquid.exchange import Exchange  # type: ignore
-from hyperliquid.info import Info          # type: ignore
+from hyperliquid import Exchange, Info  # SDK
 
 log = logging.getLogger("broker.hyperliquid")
-log.setLevel(logging.INFO)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# === Local Side enum (avoid importing a missing broker.types) ===
-class Side(str, Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
+# ---------- Environment ----------
+USD_PER_TRADE = float(os.getenv("USD_PER_TRADE", "50"))
+DEFAULT_TIF   = os.getenv("HYPER_TIF", "PostOnly")  # "PostOnly" or "Gtc" are typical
+ALLOWED = [s.strip().upper() for s in os.getenv(
+    "HYPER_ONLY_EXECUTE_SYMBOLS",
+    "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
+).split(",") if s.strip()]
 
-
-# === Dataclasses used by the broker ===
-@dataclass
-class OrderPlan:
-    is_buy: bool
-    coin: str
-    px: float           # float for SDK
-    sz: float           # float for SDK
-    tif: str            # e.g., "PostOnly", "Gtc"
-    reduce_only: bool = False
-
-
-# === Utils ===
+# ---------- Helpers ----------
 def _symbol_to_coin(symbol: str) -> str:
-    """
-    Convert something like 'BTC/USD' or 'btc/usd' -> 'BTC'
-    """
-    if not symbol:
-        return symbol
-    s = symbol.strip().upper()
-    if "/" in s:
-        return s.split("/")[0]
-    return s
+    # "BTC/USD" -> "BTC"
+    if "/" in symbol:
+        return symbol.split("/")[0].strip().upper()
+    return symbol.strip().upper()
 
+def _choose_px(entry_low: float, entry_high: float, side: str) -> float:
+    # Use inner edge of the band consistent with side
+    if side.upper() == "LONG":
+        return float(entry_low)
+    return float(entry_high)
 
-def _allowed(symbol: str) -> bool:
-    """
-    Optional allowlist: HYPER_ONLY_EXECUTE_SYMBOLS=CSV of pairs like BTC/USD,ETH/USD
-    If not set, allow all.
-    """
-    allow_csv = os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").strip()
-    if not allow_csv:
-        return True
-    allowed = [x.strip().upper() for x in allow_csv.split(",") if x.strip()]
-    ok = symbol.strip().upper() in allowed
-    log.info(
-        "[BROKER] symbol=%s allowed=%s",
-        symbol,
-        ",".join(allowed) if allowed else "(none)"
-    )
-    return ok
-
+def _quantize_attempts() -> Tuple[list[int], list[int]]:
+    # Decimals for (price_decimals, size_decimals) to try in order
+    # HL accepts up to 8, but some coins require coarser steps
+    px_try = [8, 7, 6, 5, 4, 3, 2]
+    sz_try = [8, 7, 6, 5, 4, 3, 2]
+    return px_try, sz_try
 
 def _mk_clients() -> Tuple[Exchange, Info]:
-    """
-    Try a couple of constructor styles so we work across sdk versions.
-    Wallet private key auth is the target.
-    """
+    # Wallet private key auth (recommended)
     priv = os.getenv("HYPER_PRIVATE_KEY", "").strip()
     if not priv:
         raise RuntimeError("No Hyperliquid credentials found. Set HYPER_PRIVATE_KEY (wallet private key).")
-
-    # Try common constructor styles (don’t pass unknown kwargs).
-    last_err: Optional[Exception] = None
-    for ctor in (
-        lambda: Exchange(priv),                     # positional private key
-        lambda: Exchange(private_key=priv),         # keyword private key
-        lambda: Exchange(wallet=priv),              # older alias
-    ):
-        try:
-            ex = ctor()
-            log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
-                     priv[:6], priv[-4:])
-            info = Info()
-            return ex, info
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-
-    raise RuntimeError(f"Could not initialize Hyperliquid Exchange with provided key: {last_err}")
-
-
-def _default_tif() -> str:
-    """
-    TIF comes from env, default 'PostOnly' (good for maker entries).
-    Accepts: PostOnly, Gtc, Ioc, Fok (SDK expects exact strings).
-    """
-    return os.getenv("HYPER_TIF", "PostOnly").strip()
-
-
-def _usd_per_trade() -> float:
-    """
-    Sizing in notional USD. Default small for safety. Env: USD_PER_TRADE
-    """
+    # Current SDK accepts 'Exchange(private_key)' positional
     try:
-        return float(os.getenv("USD_PER_TRADE", "50"))
-    except Exception:
-        return 50.0
+        ex = Exchange(priv)  # wallet key
+        log.info("[BROKER] Exchange init via wallet with HYPER_PRIVATE_KEY=%s…%s",
+                 priv[:6], priv[-4:])
+    except TypeError as e:
+        # Fallback: raise explicit guidance
+        raise RuntimeError("Your installed hyperliquid SDK does not accept private key positional init.") from e
 
+    info = Info()
+    return ex, info
 
-def _build_plan(
-    *,
-    side: str,
-    symbol: str,
-    entry_low: float,
-    entry_high: float,
-    leverage: Optional[float] = None,
-    tif: Optional[str] = None,
-) -> OrderPlan:
+def _build_order_dict(coin: str, is_buy: bool, sz: float, limit_px: float, tif: str) -> Dict[str, Any]:
+    # SDK order_request format expected by exchange.bulk_orders([...])
+    return {
+        "coin": coin,                # name (not asset id)
+        "is_buy": bool(is_buy),
+        "sz": float(sz),             # must match coin step
+        "limit_px": float(limit_px), # must match price tick
+        "order_type": {"limit": {"tif": tif}},  # e.g., "PostOnly" or "Gtc"
+        "reduce_only": False,
+        "cloid": None,
+    }
+
+def _try_bulk_with_rounding(ex: Exchange, order: Dict[str, Any]) -> Any:
     """
-    Build an order plan from the parsed signal. Keep px/sz as floats.
+    Retry bulk_orders by progressively reducing precision on sz/limit_px
+    until SDK accepts (avoids `float_to_wire causes rounding`).
     """
-    coin = _symbol_to_coin(symbol)
-    is_buy = side.strip().upper() == Side.LONG
-    mid_px = (float(entry_low) + float(entry_high)) / 2.0
-    tif = (tif or _default_tif()).strip()
+    px_attempts, sz_attempts = _quantize_attempts()
+    last_err: Optional[Exception] = None
 
-    # very simple sizing: USD_PER_TRADE / mid_px
-    usd = _usd_per_trade()
-    sz = max(usd / mid_px, 0.0)
+    for pd in px_attempts:
+        for sd in sz_attempts:
+            try:
+                # Quantize and try
+                order_try = dict(order)
+                order_try["limit_px"] = float(round(order["limit_px"], pd))
+                order_try["sz"] = float(round(order["sz"], sd))
+                # Ensure strictly positive size
+                if order_try["sz"] <= 0:
+                    continue
+                return ex.bulk_orders([order_try])
+            except Exception as e:
+                last_err = e
 
-    # optional leverage does not affect sz here (you can apply on position if needed)
-    plan = OrderPlan(
-        is_buy=is_buy,
-        coin=coin,
-        px=float(mid_px),
-        sz=float(sz),
-        tif=tif,
-        reduce_only=False,
-    )
+    # One last coarse attempt at 1–3 decimals for price & 3–5 for size
+    for pd in (3, 2, 1):
+        for sd in (5, 4, 3):
+            try:
+                order_try = dict(order)
+                order_try["limit_px"] = float(round(order["limit_px"], pd))
+                order_try["sz"] = float(round(order["sz"], sd))
+                if order_try["sz"] <= 0:
+                    continue
+                return ex.bulk_orders([order_try])
+            except Exception as e:
+                last_err = e
 
-    log.info(
-        "[PLAN] side=%s coin=%s px=%.8f sz=%.8f tif=%s reduceOnly=%s",
-        "BUY" if is_buy else "SELL", coin, plan.px, plan.sz, plan.tif, plan.reduce_only
-    )
-    return plan
+    raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
 
-
-# === Public API ===
+# ---------- Public entry ----------
 def submit_signal(sig) -> None:
     """
-    Bridge from execution.py: sig has fields:
-      - side ("LONG"/"SHORT")
-      - symbol ("BTC/USD", ...)
-      - entry_low, entry_high (floats)
-      - stop_loss (float)  [currently not placed as an on-exchange stop]
-      - leverage (float|None)
-      - tif (optional str)
+    Expected fields on `sig` (ExecSignal):
+      - side: "LONG" or "SHORT"
+      - symbol: like "BTC/USD"
+      - entry_low, entry_high: floats
+      - stop_loss: Optional[float]
+      - leverage: Optional[float]
+      - tpn: Optional[int]
+      - timeframe: Optional[str]
+      - tif: Optional[str]
     """
-    # basic checks / allowlist
-    if not getattr(sig, "entry_low", None) or not getattr(sig, "entry_high", None):
-        raise ValueError("Signal missing entry_band=(low, high).")
+    side = str(getattr(sig, "side")).upper()
+    symbol = str(getattr(sig, "symbol")).upper()
 
-    symbol: str = getattr(sig, "symbol")
-    if not _allowed(symbol):
+    tif = getattr(sig, "tif", None) or DEFAULT_TIF
+    if tif not in ("PostOnly", "Gtc"):
+        tif = DEFAULT_TIF
+
+    if ALLOWED and symbol not in ALLOWED:
         log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol)
         return
 
-    # Build plan
-    plan = _build_plan(
-        side=str(getattr(sig, "side")),
-        symbol=symbol,
-        entry_low=float(getattr(sig, "entry_low")),
-        entry_high=float(getattr(sig, "entry_high")),
-        leverage=float(getattr(sig, "leverage")) if getattr(sig, "leverage", None) is not None else None,
-        tif=str(getattr(sig, "tif")) if getattr(sig, "tif", None) else None,
-    )
+    entry_low = float(getattr(sig, "entry_low"))
+    entry_high = float(getattr(sig, "entry_high"))
+    is_buy = True if side == "LONG" else False
+    coin = _symbol_to_coin(symbol)
+    px = _choose_px(entry_low, entry_high, side)
+
+    ex, info = _mk_clients()
+
+    # Compute size ~ USD_PER_TRADE / price
+    try:
+        sz = USD_PER_TRADE / float(px)
+    except Exception:
+        raise RuntimeError("Invalid entry price computed for order size.")
+
+    order = _build_order_dict(coin=coin, is_buy=is_buy, sz=sz, limit_px=px, tif=tif)
 
     log.info(
-        "[BROKER] %s %s band=(%.6f,%.6f) SL=%s lev=%s TIF=%s",
-        plan.is_buy and "LONG" or "SHORT",
-        symbol,
-        float(getattr(sig, "entry_low")),
-        float(getattr(sig, "entry_high")),
-        str(getattr(sig, "stop_loss", "n/a")),
-        str(getattr(sig, "leverage", "n/a")),
-        plan.tif,
+        "[BROKER] %s %s band=(%f,%f) SL=%s lev=%s TIF=%s",
+        side, symbol, entry_low, entry_high,
+        str(getattr(sig, "stop_loss", None)),
+        str(getattr(sig, "leverage", None)),
+        tif,
     )
 
-    # Prepare SDK clients
-    ex, _ = _mk_clients()
+    # Plan log (mid-band px)
+    mid_px = (entry_low + entry_high) / 2.0
+    sz_preview = USD_PER_TRADE / max(px, 1e-9)
+    log.info("[PLAN] side=%s coin=%s px=%0.8f sz=%s tif=%s reduceOnly=False",
+             "BUY" if is_buy else "SELL", coin, mid_px, f"{sz_preview:.8f}", tif)
 
-    # Build the order payload for the SDK. Keep floats for limit_px & sz.
-    order = {
-        "coin": plan.coin,
-        "is_buy": bool(plan.is_buy),
-        "sz": float(plan.sz),
-        "limit_px": float(plan.px),
-        "order_type": {"limit": {"tif": plan.tif}},  # dict form is SDK-compatible
-        "reduce_only": bool(plan.reduce_only),
-        # You can add "cloid" here if you want client order IDs
-    }
-
-    # Place the order
     try:
-        resp = ex.bulk_orders([order])
+        resp = _try_bulk_with_rounding(ex, order)
         log.info("[BROKER] bulk_orders response: %s", str(resp))
-    except Exception as e:  # noqa: BLE001
-        # The SDK error you saw ("Unknown format code 'f' ...") is caused by passing strings for floats.
-        # We're passing floats now, so if this triggers again, it’s a different issue (log it).
+    except Exception as e:
+        # Surface the most useful error
         raise RuntimeError(f"SDK bulk_orders failed: {e}") from e
