@@ -4,8 +4,7 @@ httpx==0.27.2
 pydantic==2.9.2
 
 # Hyperliquid + deps
-hyperliquid-python-sdk==0.20.0
+hyperliquid==1.1.7
 requests>=2.31.0
 websockets>=12.0
-eth-account>=0.10.0
-
+eth_account>=0.9.0
