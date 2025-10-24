@@ -1,219 +1,168 @@
-"""
-Broker adapter for Hyperliquid (SDK v1.1.7).
-- Single SDK only: `hyperliquid==1.1.7`
-- Wallet auth: Exchange(privkey=HYPER_PRIVATE_KEY)
-- Post-only via TIF='Alo' (Add Liquidity Only)
-- Pre-quantizes price/size to 8dp to avoid float_to_wire rounding errors
-"""
-
-from __future__ import annotations
-import os
 import logging
-from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Tuple
+import os
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-from hyperliquid import Exchange, Info  # SDK 1.1.7
+# --- Hyperliquid 0.4.66 imports (submodules) ---
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.wallet import Wallet
 
-log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
+log = logging.getLogger("broker.hyperliquid")
+if not log.handlers:
+    logging.basicConfig(level=logging.INFO)
 
-# ---------- Config ----------
-HYPER_PRIVATE_KEY = os.getenv("HYPER_PRIVATE_KEY")  # required
-DEFAULT_USD_NOTIONAL = float(os.getenv("HYPER_USD_NOTIONAL", "50"))  # $ notional per signal
-# Comma-separated list of "COIN/USD" to allow; empty = allow any
-ONLY_EXECUTE = set(
-    s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip()
-)
+# Symbols you actually want to allow the bot to trade
+DEFAULT_ALLOWED = "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
+ALLOWED = set(os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", DEFAULT_ALLOWED).split(","))
 
-# TIF to use for entry orders: "Alo" = post-only, "Gtc" = good-till-cancel, "Ioc" = immediate-or-cancel
-ENTRY_TIF = os.getenv("HYPER_ENTRY_TIF", "Alo")
+# Size / price precision guards to avoid "float_to_wire causes rounding"
+# BTC typically supports 1e-4 size precision and ~0.5 price tick.
+# We keep this conservative to satisfy wire rounding:
+DEFAULT_SZ_DP = int(os.getenv("HYPER_SIZE_DP", "4"))     # e.g., 0.0001 BTC
+DEFAULT_PX_DP = int(os.getenv("HYPER_PRICE_DP", "2"))    # e.g., $109525.00
 
+# PostOnly maker tif in wire shape for 0.4.66
+POST_ONLY_ORDER_TYPE = {"limit": {"tif": "Alo"}}  # ALO = Add Liquidity Only (post-only)
+IOC_ORDER_TYPE       = {"limit": {"tif": "Ioc"}}
 
-# ---------- Utilities ----------
-def _require_privkey() -> str:
-    if not HYPER_PRIVATE_KEY:
-        raise RuntimeError("HYPER_PRIVATE_KEY is not set.")
-    return HYPER_PRIVATE_KEY
+@dataclass
+class ExecSignal:
+    side: str                 # "LONG" | "SHORT"
+    symbol: str               # "BTC/USD"
+    entry_low: float
+    entry_high: float
+    stop_loss: Optional[float] = None
+    leverage: Optional[float] = None
+    tf: Optional[str] = None  # not used by broker
+
+@dataclass
+class Plan:
+    is_buy: bool
+    coin: str
+    limit_px: float
+    sz: float
+    tif_post_only: bool
+    reduce_only: bool = False
 
 
 def _mk_clients() -> Tuple[Exchange, Info]:
-    """Create SDK clients using wallet private key (string)."""
-    priv = _require_privkey()
-    # SDK 1.1.7 takes `privkey` and constructs the wallet internally
-    ex = Exchange(privkey=priv)
+    """Construct Wallet->Exchange and Info for SDK 0.4.66."""
+    priv = os.getenv("HYPER_PRIVATE_KEY", "").strip()
+    if not priv:
+        raise RuntimeError("HYPER_PRIVATE_KEY is required (0x-prefixed EVM private key).")
+
+    # Wallet.from_key accepts hex string (with or without 0x)
+    wallet = Wallet.from_key(priv)
+    ex = Exchange(wallet=wallet)
     info = Info()
-    log.info("[BROKER] Exchange init via wallet (privkey=*****)")
+    log.info("[BROKER] hyperliquid.py loaded")
     return ex, info
 
 
-def _quant8(x: float) -> float:
-    """
-    Quantize to 8 decimal places (no rounding up) so SDK's float_to_wire
-    won't need to round (which would raise).
-    """
-    d = Decimal(str(x)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-    return float(d)
+def _symbol_to_coin(symbol: str) -> str:
+    # "BTC/USD" -> "BTC"
+    if "/" in symbol:
+        return symbol.split("/", 1)[0]
+    return symbol
 
 
-def _parse_symbol_coin(symbol_sig: str) -> str:
-    """
-    Convert 'BTC/USD' -> 'BTC' (SDK expects coin ticker without '/USD').
-    """
-    sym = (symbol_sig or "").strip().upper()
-    if "/" in sym:
-        return sym.split("/")[0]
-    return sym
+def _clamp_precision(x: float, dp: int) -> float:
+    # Round to dp decimals in a wire-friendly way
+    factor = 10 ** dp
+    return int(round(x * factor)) / factor
 
 
-def _want_to_trade(symbol_sig: str) -> bool:
-    if not ONLY_EXECUTE:
-        return True
-    return symbol_sig.upper() in ONLY_EXECUTE
+def _plan_from_signal(sig: ExecSignal, info: Info) -> Plan:
+    if sig.symbol not in ALLOWED:
+        log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", sig.symbol)
+        raise RuntimeError("Symbol not allowed")
+
+    if sig.entry_low is None or sig.entry_high is None:
+        raise ValueError("Signal missing entry_band=(low, high).")
+
+    coin = _symbol_to_coin(sig.symbol)
+    is_buy = sig.side.upper() == "LONG"
+    mid_px = (float(sig.entry_low) + float(sig.entry_high)) / 2.0
+
+    # Clamp price and size
+    limit_px = _clamp_precision(float(mid_px), DEFAULT_PX_DP)
+
+    # Position sizing: you probably have your own calc; we just do a tiny notional
+    # e.g., $50 notional divided by price -> BTC size
+    target_notional = float(os.getenv("HYPER_TEST_NOTIONAL_USD", "50"))
+    raw_sz = target_notional / max(limit_px, 1e-9)
+    sz = _clamp_precision(raw_sz, DEFAULT_SZ_DP)
+
+    if sz <= 0:
+        raise ValueError("Computed size is zero; increase HYPER_TEST_NOTIONAL_USD.")
+
+    return Plan(
+        is_buy=is_buy,
+        coin=coin,
+        limit_px=limit_px,
+        sz=sz,
+        tif_post_only=True,       # default to post-only maker
+        reduce_only=False,
+    )
 
 
-def _side_is_buy(side_sig: str) -> bool:
-    s = (side_sig or "").strip().upper()
-    # Accept LONG/BUY for buy, SHORT/SELL for sell
-    return s in ("LONG", "BUY")
-
-
-def _mid(a: float, b: float) -> float:
-    return (float(a) + float(b)) / 2.0
-
-
-def _build_limit_order(coin: str, is_buy: bool, sz: float, limit_px: float, tif: str) -> Dict[str, Any]:
-    """
-    Order request format expected by hyperliquid==1.1.7:
-    {
-      "coin": "BTC",
-      "is_buy": true,
-      "sz": 0.00123456,
-      "limit_px": 109525.0,
-      "order_type": {"limit": {"tif": "Gtc"}},  # or "Alo" for post-only
-      "reduce_only": false
+def _build_order(plan: Plan) -> dict:
+    order_type = POST_ONLY_ORDER_TYPE if plan.tif_post_only else IOC_ORDER_TYPE
+    order = {
+        "coin": plan.coin,
+        "is_buy": bool(plan.is_buy),
+        "sz": float(plan.sz),
+        "limit_px": float(plan.limit_px),
+        "order_type": order_type,
+        "reduce_only": bool(plan.reduce_only),
     }
-    """
-    if tif not in ("Alo", "Gtc", "Ioc"):
-        tif = "Gtc"
-    return {
-        "coin": coin,
-        "is_buy": bool(is_buy),
-        "sz": _quant8(sz),
-        "limit_px": _quant8(limit_px),
-        "order_type": {"limit": {"tif": tif}},
-        "reduce_only": False,
-    }
+    return order
 
 
-def _usd_notional_to_sz(usd_notional: float, px: float) -> float:
-    """
-    Convert USD notional to coin size.
-    (Hyperliquid isolates leverage separately; here we size on notional only.)
-    """
-    if px <= 0:
-        raise ValueError("Invalid price for sizing.")
-    return usd_notional / px
+def _try_bulk_with_rounding(ex: Exchange, order: dict) -> dict:
+    """Retry around wire rounding by nudging size to the allowed dp."""
+    last_err: Optional[Exception] = None
 
-
-def _try_bulk_orders_with_safe_rounding(ex: Exchange, order: Dict[str, Any]) -> Any:
-    """
-    Try bulk_orders; if float_to_wire complains about rounding, progressively
-    shrink size by 1 sat (1e-8) until it succeeds (up to a few steps).
-    """
-    last_err: Exception | None = None
-    for _ in range(10):
+    for _ in range(3):
         try:
-            # Ensure we pass values that never trigger SDK rounding
-            order = {
-                **order,
-                "sz": _quant8(order["sz"]),
-                "limit_px": _quant8(order["limit_px"]),
-            }
-            return ex.bulk_orders([order])
-        except Exception as e:  # noqa
-            msg = str(e)
+            return ex.bulk_orders([order])  # returns SDK response dict
+        except Exception as e:
             last_err = e
-            # Typical SDK rounding errors:
-            #  - "float_to_wire causes rounding"
-            #  - size too precise
-            #  - or downstream signing/encode if wallet not constructed properly
-            if "float_to_wire causes rounding" in msg or "Unknown format code 'f'" in msg:
-                # reduce size by 1e-8 and retry
-                order["sz"] = max(0.0, _quant8(order["sz"] - 1e-8))
-                continue
-            # if it's not a rounding complaint, bail
-            break
+            # Nudge size down one unit of precision and try again
+            step = 10 ** (-DEFAULT_SZ_DP)
+            order["sz"] = max(0.0, float(order["sz"]) - step)
+
     raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
 
 
-# ---------- Public entrypoint ----------
-def submit_signal(sig: Any) -> None:
-    """
-    Execute a simple band entry as a single post-only (Alo) limit order at band mid.
+def submit_signal(sig: ExecSignal) -> None:
+    """Main entrypoint called by your execution layer."""
+    ex, info = _mk_clients()
 
-    Expected attributes on `sig`:
-      - side: "LONG"/"SHORT" or "BUY"/"SELL"
-      - symbol: like "BTC/USD"
-      - entry_low, entry_high: floats
-      - stop_loss: float (optional)
-      - leverage: float (optional)
-
-    We size using USD notional (env HYPER_USD_NOTIONAL, default $50).
-    """
-    # Pull attributes safely whether `sig` is a dataclass, pydantic model, or dict-like
-    def g(name: str, default=None):
-        return getattr(sig, name, getattr(sig, name.replace("-", "_"), default))
-
-    side_sig = g("side")
-    symbol_sig = g("symbol")
-    low = g("entry_low", g("band_low", None))
-    high = g("entry_high", g("band_high", None))
-    sl = g("stop_loss", g("sl", None))
-    lev = g("leverage", g("lev", None))
-
-    # Basic validation
-    if not side_sig or not symbol_sig:
-        raise ValueError("Signal missing side and/or symbol.")
-    if low is None or high is None:
-        raise ValueError("Signal missing entry_band=(low, high).")
-
-    symbol_sig = str(symbol_sig).upper()
-    if not _want_to_trade(symbol_sig):
-        log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", symbol_sig)
-        return
-
-    coin = _parse_symbol_coin(symbol_sig)
-    is_buy = _side_is_buy(side_sig)
-    px = _mid(float(low), float(high))
-    px = _quant8(px)  # ensure ≤8dp
-
-    # Size on USD notional (ignore leverage for order sizing; leverage is controlled on exchange)
-    usd_notional = DEFAULT_USD_NOTIONAL
-    sz = _usd_notional_to_sz(usd_notional, px)
-    sz = _quant8(sz)
+    plan = _plan_from_signal(sig, info)
+    log.info(
+        "[BROKER] %s %s band=(%.6f,%.6f) SL=%s lev=%s TIF=%s",
+        "BUY" if plan.is_buy else "SELL",
+        f"{sig.symbol}",
+        float(sig.entry_low),
+        float(sig.entry_high),
+        str(sig.stop_loss),
+        str(sig.leverage),
+        "PostOnly" if plan.tif_post_only else "IOC",
+    )
 
     log.info(
-        "[BROKER] %s %s band=(%f,%f) SL=%s lev=%s TIF=%s",
-        "BUY" if is_buy else "SELL",
-        symbol_sig,
-        float(low),
-        float(high),
-        sl if sl is not None else "n/a",
-        lev if lev is not None else "n/a",
-        ENTRY_TIF,
-    )
-    log.info("[BROKER] PLAN side=%s coin=%s px=%.8f sz=%.8f tif=%s reduceOnly=%s",
-             "BUY" if is_buy else "SELL", coin, px, sz, ENTRY_TIF, False)
-
-    ex, _info = _mk_clients()
-
-    order = _build_limit_order(
-        coin=coin,
-        is_buy=is_buy,
-        sz=sz,
-        limit_px=px,
-        tif=ENTRY_TIF,  # 'Alo' = post-only
+        "[BROKER] PLAN side=%s coin=%s px=%.8f sz=%.*f tif=%s reduceOnly=%s",
+        "BUY" if plan.is_buy else "SELL",
+        plan.coin,
+        plan.limit_px,
+        DEFAULT_SZ_DP,
+        plan.sz,
+        "PostOnly" if plan.tif_post_only else "IOC",
+        plan.reduce_only,
     )
 
-    resp = _try_bulk_orders_with_safe_rounding(ex, order)
-    log.info("[BROKER] bulk_orders OK: %s", resp)
+    order = _build_order(plan)
+    resp = _try_bulk_with_rounding(ex, order)
+    log.info("[BROKER] bulk_orders resp: %s", resp)
