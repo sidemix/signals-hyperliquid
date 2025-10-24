@@ -4,7 +4,7 @@ python-dotenv==1.0.1
 httpx==0.27.2
 pydantic==2.9.2
 
-# Hyperliquid (one SDK only — do NOT also install hyperliquid-python-sdk)
+# Hyperliquid SDK (this specific build is available and stable)
 hyperliquid==0.4.66
 
 # Deps
