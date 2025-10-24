@@ -1,11 +1,18 @@
 import os
 import logging
+
+from bootcheck import run_startup_checks
+run_startup_checks()
+# … then your normal bot setup/imports/logging
+
 from typing import Optional, Tuple
 
 import discord
 
 from execution import ExecSignal, execute_signal
 from parser import parse_signal  # your existing parser
+
+
 
 log = logging.getLogger("discord_listener")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
