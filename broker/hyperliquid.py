@@ -1,31 +1,60 @@
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
-
-# --- Hyperliquid 0.4.66 imports (submodules) ---
-from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
-from hyperliquid.wallet import Wallet
+from typing import Optional, Tuple, Any, List
 
 log = logging.getLogger("broker.hyperliquid")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# Symbols you actually want to allow the bot to trade
-DEFAULT_ALLOWED = "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
-ALLOWED = set(os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", DEFAULT_ALLOWED).split(","))
+# =========================
+# Dynamic SDK compatibility
+# =========================
+def _resolve_hl() -> Tuple[Any, Any, Any, str]:
+    """
+    Returns (Exchange, Info, Wallet, layout_tag)
+    Tries multiple import layouts so we work with whatever wheel is actually installed.
+    """
+    try:
+        import hyperliquid as hl
+        version = getattr(hl, "__version__", "unknown")
+        log.info("[BROKER] hyperliquid base module=%s version=%s", getattr(hl, "__file__", "?"), version)
+    except Exception:
+        version = "unknown"
 
-# Size / price precision guards to avoid "float_to_wire causes rounding"
-# BTC typically supports 1e-4 size precision and ~0.5 price tick.
-# We keep this conservative to satisfy wire rounding:
-DEFAULT_SZ_DP = int(os.getenv("HYPER_SIZE_DP", "4"))     # e.g., 0.0001 BTC
-DEFAULT_PX_DP = int(os.getenv("HYPER_PRICE_DP", "2"))    # e.g., $109525.00
+    # Layout A: 0.4.x submodules (preferred)
+    try:
+        from hyperliquid.exchange import Exchange  # type: ignore
+        from hyperliquid.info import Info          # type: ignore
+        from hyperliquid.wallet import Wallet      # type: ignore
+        log.info("[BROKER] Using layout A (submodules: exchange/info/wallet)")
+        return Exchange, Info, Wallet, "A"
+    except Exception:
+        pass
 
-# PostOnly maker tif in wire shape for 0.4.66
-POST_ONLY_ORDER_TYPE = {"limit": {"tif": "Alo"}}  # ALO = Add Liquidity Only (post-only)
-IOC_ORDER_TYPE       = {"limit": {"tif": "Ioc"}}
+    # Layout B: top-level (some builds expose Exchange/Info top-level, Wallet in wallet)
+    try:
+        from hyperliquid import Exchange, Info     # type: ignore
+        from hyperliquid.wallet import Wallet      # type: ignore
+        log.info("[BROKER] Using layout B (top-level Exchange/Info, wallet submodule)")
+        return Exchange, Info, Wallet, "B"
+    except Exception:
+        pass
 
+    # Layout C: everything top-level (rare)
+    try:
+        from hyperliquid import Exchange, Info, Wallet  # type: ignore
+        log.info("[BROKER] Using layout C (all top-level)")
+        return Exchange, Info, Wallet, "C"
+    except Exception as e:
+        raise RuntimeError(
+            "Could not resolve Hyperliquid SDK layout. Ensure only one HL package is installed."
+        ) from e
+
+
+# =========================
+# Datatypes
+# =========================
 @dataclass
 class ExecSignal:
     side: str                 # "LONG" | "SHORT"
@@ -46,34 +75,55 @@ class Plan:
     reduce_only: bool = False
 
 
-def _mk_clients() -> Tuple[Exchange, Info]:
-    """Construct Wallet->Exchange and Info for SDK 0.4.66."""
+# =========================
+# Config
+# =========================
+DEFAULT_ALLOWED = "AVAX/USD,BIO/USD,BNB/USD,BTC/USD,CRV/USD,ETH/USD,ETHFI/USD,LINK/USD,MNT/USD,PAXG/USD,SNX/USD,SOL/USD,STBL/USD,TAO/USD,ZORA/USD"
+ALLOWED = set(os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", DEFAULT_ALLOWED).split(","))
+
+DEFAULT_SZ_DP = int(os.getenv("HYPER_SIZE_DP", "4"))     # e.g. 0.0001 BTC
+DEFAULT_PX_DP = int(os.getenv("HYPER_PRICE_DP", "2"))    # e.g. $xxxxx.xx
+
+
+# =========================
+# Utilities
+# =========================
+def _mk_clients() -> Tuple[Any, Any, str]:
+    """Construct Wallet->Exchange and Info using whichever SDK shape is present."""
+    Exchange, Info, Wallet, layout = _resolve_hl()
+
     priv = os.getenv("HYPER_PRIVATE_KEY", "").strip()
     if not priv:
         raise RuntimeError("HYPER_PRIVATE_KEY is required (0x-prefixed EVM private key).")
 
-    # Wallet.from_key accepts hex string (with or without 0x)
-    wallet = Wallet.from_key(priv)
-    ex = Exchange(wallet=wallet)
+    # Build Wallet then Exchange — this works on all recent HL wheels
+    try:
+        wallet = Wallet.from_key(priv)  # hex key (with/without 0x)
+    except Exception as e:
+        raise RuntimeError(f"Wallet.from_key failed: {e}")
+
+    # Some older builds require keyword 'wallet=', some accept positional; we normalize to kw.
+    try:
+        ex = Exchange(wallet=wallet)
+    except TypeError:
+        # Very old builds might want Exchange(wallet) positional
+        ex = Exchange(wallet)
+
     info = Info()
-    log.info("[BROKER] hyperliquid.py loaded")
-    return ex, info
+    log.info("[BROKER] hyperliquid.py loaded (layout=%s)", layout)
+    return ex, info, layout
 
 
 def _symbol_to_coin(symbol: str) -> str:
-    # "BTC/USD" -> "BTC"
-    if "/" in symbol:
-        return symbol.split("/", 1)[0]
-    return symbol
+    return symbol.split("/", 1)[0] if "/" in symbol else symbol
 
 
 def _clamp_precision(x: float, dp: int) -> float:
-    # Round to dp decimals in a wire-friendly way
     factor = 10 ** dp
     return int(round(x * factor)) / factor
 
 
-def _plan_from_signal(sig: ExecSignal, info: Info) -> Plan:
+def _plan_from_signal(sig: ExecSignal, info: Any) -> Plan:
     if sig.symbol not in ALLOWED:
         log.info("[BROKER] Skipping symbol not in HYPER_ONLY_EXECUTE_SYMBOLS: %s", sig.symbol)
         raise RuntimeError("Symbol not allowed")
@@ -85,15 +135,11 @@ def _plan_from_signal(sig: ExecSignal, info: Info) -> Plan:
     is_buy = sig.side.upper() == "LONG"
     mid_px = (float(sig.entry_low) + float(sig.entry_high)) / 2.0
 
-    # Clamp price and size
     limit_px = _clamp_precision(float(mid_px), DEFAULT_PX_DP)
 
-    # Position sizing: you probably have your own calc; we just do a tiny notional
-    # e.g., $50 notional divided by price -> BTC size
     target_notional = float(os.getenv("HYPER_TEST_NOTIONAL_USD", "50"))
     raw_sz = target_notional / max(limit_px, 1e-9)
     sz = _clamp_precision(raw_sz, DEFAULT_SZ_DP)
-
     if sz <= 0:
         raise ValueError("Computed size is zero; increase HYPER_TEST_NOTIONAL_USD.")
 
@@ -102,14 +148,27 @@ def _plan_from_signal(sig: ExecSignal, info: Info) -> Plan:
         coin=coin,
         limit_px=limit_px,
         sz=sz,
-        tif_post_only=True,       # default to post-only maker
+        tif_post_only=True,
         reduce_only=False,
     )
 
 
-def _build_order(plan: Plan) -> dict:
-    order_type = POST_ONLY_ORDER_TYPE if plan.tif_post_only else IOC_ORDER_TYPE
-    order = {
+def _order_type_candidates() -> List[dict]:
+    """
+    Different HL SDKs accept different wire shapes. We’ll try the common, valid ones:
+      - {"limit": {"tif": "Alo"}}  # Add Liquidity Only (post-only)
+      - {"postOnly": {}}           # some older builds
+      - {"limit": {"tif": "Ioc"}}  # IOC fallback (not used by default plan)
+    """
+    return [
+        {"limit": {"tif": "Alo"}},
+        {"postOnly": {}},
+        {"limit": {"tif": "Ioc"}},
+    ]
+
+
+def _build_order(plan: Plan, order_type: dict) -> dict:
+    return {
         "coin": plan.coin,
         "is_buy": bool(plan.is_buy),
         "sz": float(plan.sz),
@@ -117,52 +176,60 @@ def _build_order(plan: Plan) -> dict:
         "order_type": order_type,
         "reduce_only": bool(plan.reduce_only),
     }
-    return order
 
 
-def _try_bulk_with_rounding(ex: Exchange, order: dict) -> dict:
-    """Retry around wire rounding by nudging size to the allowed dp."""
+def _try_bulk_with_rounding(ex: Any, order: dict) -> dict:
+    """
+    Retry around:
+      - float_to_wire rounding
+      - order_type shape differences
+    We iterate order_type candidates and nudge 'sz' down by one size tick across a few attempts.
+    """
     last_err: Optional[Exception] = None
+    size_step = 10 ** (-DEFAULT_SZ_DP)
 
-    for _ in range(3):
-        try:
-            return ex.bulk_orders([order])  # returns SDK response dict
-        except Exception as e:
-            last_err = e
-            # Nudge size down one unit of precision and try again
-            step = 10 ** (-DEFAULT_SZ_DP)
-            order["sz"] = max(0.0, float(order["sz"]) - step)
+    for ot in _order_type_candidates():
+        # reset to candidate order_type
+        order["order_type"] = ot
+        for _ in range(3):
+            try:
+                return ex.bulk_orders([order])
+            except Exception as e:
+                last_err = e
+                # Nudge size down one precision step and retry
+                order["sz"] = max(0.0, float(order["sz"]) - size_step)
 
     raise RuntimeError(f"SDK bulk_orders failed after rounding attempts: {last_err}")
 
 
+# =========================
+# Entry point
+# =========================
 def submit_signal(sig: ExecSignal) -> None:
-    """Main entrypoint called by your execution layer."""
-    ex, info = _mk_clients()
-
+    ex, info, layout = _mk_clients()
     plan = _plan_from_signal(sig, info)
+
     log.info(
         "[BROKER] %s %s band=(%.6f,%.6f) SL=%s lev=%s TIF=%s",
         "BUY" if plan.is_buy else "SELL",
-        f"{sig.symbol}",
+        sig.symbol,
         float(sig.entry_low),
         float(sig.entry_high),
         str(sig.stop_loss),
         str(sig.leverage),
         "PostOnly" if plan.tif_post_only else "IOC",
     )
-
     log.info(
-        "[BROKER] PLAN side=%s coin=%s px=%.8f sz=%.*f tif=%s reduceOnly=%s",
+        "[BROKER] PLAN side=%s coin=%s px=%.8f sz=%.*f reduceOnly=%s",
         "BUY" if plan.is_buy else "SELL",
         plan.coin,
         plan.limit_px,
         DEFAULT_SZ_DP,
         plan.sz,
-        "PostOnly" if plan.tif_post_only else "IOC",
         plan.reduce_only,
     )
 
-    order = _build_order(plan)
+    # Try the order with compatibility fallbacks
+    order = _build_order(plan, {"limit": {"tif": "Alo"}})
     resp = _try_bulk_with_rounding(ex, order)
     log.info("[BROKER] bulk_orders resp: %s", resp)
