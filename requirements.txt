@@ -3,7 +3,7 @@ python-dotenv==1.0.1
 httpx==0.27.2
 pydantic==2.9.2
 
-# Official Hyperliquid SDK (the one with Exchange/Info/Wallet)
+# ✅ Official Hyperliquid SDK (has Exchange, Info, Wallet as modules)
 hyperliquid-python-sdk==0.20.0
 
 requests==2.32.3
