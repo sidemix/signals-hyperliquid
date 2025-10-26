@@ -2,6 +2,7 @@
 import os
 import logging
 import sys
+from collections import deque
 
 from bootcheck import run_startup_checks
 run_startup_checks()
@@ -16,8 +17,6 @@ from parser import parse_signal
 root_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=root_level, stream=sys.stdout)
 log = logging.getLogger("discord_listener")
-
-# Turn on discord internals so we see auth/gateway issues
 logging.getLogger("discord").setLevel(root_level)
 logging.getLogger("discord.client").setLevel(root_level)
 logging.getLogger("discord.gateway").setLevel(root_level)
@@ -44,6 +43,23 @@ intents = discord.Intents.default()
 intents.message_content = True   # must also be enabled in Dev Portal
 intents.guilds = True
 client = discord.Client(intents=intents)
+
+# ---------- Duplicate message guard ----------
+_RECENT_IDS = deque(maxlen=1000)
+_RECENT_SET = set()
+
+def _seen(msg_id: int) -> bool:
+    """Return True if we've processed this message id recently; else record and return False."""
+    if msg_id in _RECENT_SET:
+        return True
+    _RECENT_SET.add(msg_id)
+    _RECENT_IDS.append(msg_id)
+    if len(_RECENT_IDS) == _RECENT_IDS.maxlen:
+        # prune oldest if the deque is at capacity
+        oldest = _RECENT_IDS[0]
+        if oldest in _RECENT_SET:
+            _RECENT_SET.discard(oldest)
+    return False
 
 def _coerce_entry_band(parsed) -> Tuple[Optional[float], Optional[float]]:
     low = getattr(parsed, "entry_low", None)
@@ -86,6 +102,11 @@ async def on_message(message: discord.Message):
         if message.channel.id not in WATCH_CHANNEL_IDS:
             return
 
+        # ---- De-duplicate by message ID ----
+        if _seen(message.id):
+            log.info("[RX] Duplicate message id=%s (skipping).", message.id)
+            return
+
         content = message.content or ""
         log.info("[RX] ch=%s by=%s id=%s len=%d", message.channel.id, message.author, message.id, len(content))
 
@@ -124,7 +145,7 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     try:
         log.info("[BOOT] Starting Discord client…")
-        client.run(BOT_TOKEN, log_handler=None)  # use our logging, not discord.py’s default handler
+        client.run(BOT_TOKEN, log_handler=None)
     except Exception as e:
         log.exception("[FATAL] client.run failed: %s", e)
         raise
