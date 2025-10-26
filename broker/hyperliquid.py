@@ -3,12 +3,29 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Optional, Any, Iterable
 
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+
+# Optional Redis (for cross-container idempotency)
+_IDEMP_REDIS_URL = os.getenv("IDEMP_REDIS_URL", "").strip()
+_redis = None
+if _IDEMP_REDIS_URL:
+    try:
+        import redis  # pip install redis
+        _redis = redis.Redis.from_url(_IDEMP_REDIS_URL, decode_responses=True)
+    except Exception as _e:
+        _redis = None
+
+# Optional fcntl file lock (Linux)
+_filelock_supported = True
+try:
+    import fcntl  # not on Windows
+except Exception:
+    _filelock_supported = False
 
 log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
@@ -22,54 +39,12 @@ _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
 _API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()
 
-# ---- Cross-process idempotency (SQLite) ----
-_IDEMP_DB_PATH = os.getenv("IDEMP_DB_PATH", "/tmp/hyper_idempotency.db")
+# ---- Idempotency storage ----
 _IDEMP_TTL_SECS = int(os.getenv("IDEMP_TTL_SECS", "86400"))  # 24h
+_IDEMP_DB_PATH = os.getenv("IDEMP_DB_PATH", "/tmp/hyper_idempotency.db")
+_IDEMP_LOCKFILE = os.getenv("IDEMP_LOCKFILE", "/tmp/hyper_idempotency.lock")
 
-def _idemp_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(_IDEMP_DB_PATH, timeout=10, isolation_level=None)  # autocommit
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sent_client_ids (
-            client_id TEXT PRIMARY KEY,
-            ts INTEGER NOT NULL
-        )
-    """)
-    return conn
-
-def _purge_old(conn: sqlite3.Connection, now: int) -> None:
-    try:
-        conn.execute("DELETE FROM sent_client_ids WHERE ts < ?", (now - _IDEMP_TTL_SECS,))
-    except Exception:
-        pass
-
-def _idempotent_claim(client_id: Optional[str]) -> bool:
-    """Atomically claim a client_id. True = first sender, False = duplicate."""
-    if not client_id:
-        return True
-    conn = None
-    try:
-        now = int(time.time())
-        conn = _idemp_conn()
-        _purge_old(conn, now)
-        conn.execute("INSERT INTO sent_client_ids (client_id, ts) VALUES (?, ?)", (client_id, now))
-        log.info("[HL] IDEMP: claimed client_id=%s", client_id)
-        return True
-    except sqlite3.IntegrityError:
-        log.info("[HL] SKIP duplicate (cross-process) client_id=%s", client_id)
-        return False
-    except Exception as e:
-        log.exception("[HL] Idempotency DB error (proceeding best-effort): %s", e)
-        return True
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-
-# Per-process guard (same interpreter)
+# Process-local guard
 _SENT_CLIENT_IDS: set[str] = set()
 
 def _api_url() -> str:
@@ -147,7 +122,8 @@ def _try_get_assets_container(info: Info) -> Optional[Any]:
 def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
     try:
         res = info.name_to_asset(coin)
-        if isinstance(res, dict): return res
+        if isinstance(res, dict):
+            return res
         if isinstance(res, int):
             container = _try_get_assets_container(info)
             if container and 0 <= res < len(container):
@@ -184,6 +160,150 @@ def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float
                 break
     return price_tick, size_step, min_sz
 
+# ---------- Idempotency (Redis → SQLite+lock) ----------
+def _redis_claim(client_id: str) -> Optional[bool]:
+    if not _redis:
+        return None
+    try:
+        ok = _redis.set(name=f"hl:idemp:{client_id}", value="1", nx=True, ex=_IDEMP_TTL_SECS)
+        if ok:
+            log.info("[HL] IDEMP[redis]: claimed %s", client_id)
+            return True
+        else:
+            log.info("[HL] SKIP duplicate (redis) %s", client_id)
+            return False
+    except Exception as e:
+        log.exception("[HL] Redis idempotency error (falling back): %s", e)
+        return None
+
+def _sqlite_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_IDEMP_DB_PATH, timeout=10, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_client_ids (
+            client_id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL
+        )
+    """)
+    return conn
+
+def _sqlite_claim(client_id: str) -> bool:
+    now = int(time.time())
+    conn = None
+    lockf = None
+    try:
+        if _filelock_supported:
+            lockf = open(_IDEMP_LOCKFILE, "a+")
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+        conn = _sqlite_conn()
+        conn.execute("DELETE FROM sent_client_ids WHERE ts < ?", (now - _IDEMP_TTL_SECS,))
+        conn.execute("INSERT INTO sent_client_ids (client_id, ts) VALUES (?, ?)", (client_id, now))
+        log.info("[HL] IDEMP[sqlite]: claimed %s", client_id)
+        return True
+    except sqlite3.IntegrityError:
+        log.info("[HL] SKIP duplicate (sqlite) %s", client_id)
+        return False
+    except Exception as e:
+        log.exception("[HL] SQLite idempotency error (best-effort continue): %s", e)
+        return True
+    finally:
+        try:
+            if conn: conn.close()
+        except Exception:
+            pass
+        if _filelock_supported and lockf:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+                lockf.close()
+            except Exception:
+                pass
+
+def _claim_client_id(client_id: Optional[str]) -> bool:
+    if not client_id:
+        return True
+    # Process-local fast path
+    if client_id in _SENT_CLIENT_IDS:
+        log.info("[HL] SKIP duplicate (process) %s", client_id)
+        return False
+    # Cross-container Redis first
+    res = _redis_claim(client_id)
+    if res is True:
+        _SENT_CLIENT_IDS.add(client_id)
+        return True
+    if res is False:
+        return False
+    # Fallback to SQLite+lock
+    if _sqlite_claim(client_id):
+        _SENT_CLIENT_IDS.add(client_id)
+        return True
+    return False
+
+# ---------- Open-order duplicate check ----------
+def _iter_open_orders(info: Info) -> Iterable[dict]:
+    """
+    Tries several SDK layouts to yield open order dicts with keys:
+    coin, isBuy/is_buy, px/price, sz/size, reduceOnly/reduce_only, clientId/client_id
+    """
+    # 1) direct call
+    for attr in ("open_orders", "user_open_orders"):
+        fn = getattr(info, attr, None)
+        if callable(fn):
+            try:
+                oo = fn()
+                if isinstance(oo, (list, tuple)):
+                    for x in oo:
+                        if isinstance(x, dict):
+                            yield x
+                elif isinstance(oo, dict):
+                    for arr in oo.values():
+                        if isinstance(arr, (list, tuple)):
+                            for x in arr:
+                                if isinstance(x, dict): yield x
+            except Exception:
+                pass
+    # 2) user_state blob
+    state = None
+    for attr in ("user_state", "userState", "account_state", "accountState"):
+        fn = getattr(info, attr, None)
+        if callable(fn):
+            try:
+                state = fn()
+                break
+            except Exception:
+                pass
+    if isinstance(state, dict):
+        for key in ("openOrders", "open_orders", "orders"):
+            arr = state.get(key)
+            if isinstance(arr, (list, tuple)):
+                for x in arr:
+                    if isinstance(x, dict): yield x
+
+def _order_matches(o: dict, coin: str, is_buy: bool, limit_px: float, size: float) -> bool:
+    try:
+        o_coin = o.get("coin") or o.get("asset") or o.get("symbol")
+        o_isbuy = (o.get("isBuy") if "isBuy" in o else o.get("is_buy"))
+        o_px = o.get("px", o.get("price"))
+        o_sz = o.get("sz", o.get("size"))
+        if isinstance(o_isbuy, str):
+            o_isbuy = o_isbuy.lower() in ("true", "1", "yes", "buy", "long")
+        # normalize floats
+        o_px = float(o_px) if o_px is not None else None
+        o_sz = float(o_sz) if o_sz is not None else None
+        if (o_coin or "").upper() != coin.upper():
+            return False
+        if bool(o_isbuy) != bool(is_buy):
+            return False
+        # exact px match or within 1 tick (server rounding)
+        if o_px is None or abs(o_px - float(limit_px)) > 1e-12:
+            return False
+        # accept slight sz round
+        if o_sz is None or abs(o_sz - float(size)) > 1e-9:
+            return False
+        return True
+    except Exception:
+        return False
+
 # ---------- Main ----------
 def submit_signal(sig) -> None:
     if sig is None:
@@ -209,18 +329,10 @@ def submit_signal(sig) -> None:
     entry_high = float(entry_high)
     mid = (entry_low + entry_high) / 2.0
 
-    # Build client_id as early as possible and claim it BEFORE network calls
+    # Build client_id early and claim BEFORE any network calls
     client_id = getattr(sig, "client_id", None)
-
-    # Process-local guard
-    if client_id:
-        if client_id in _SENT_CLIENT_IDS:
-            log.info("[HL] SKIP duplicate (process-local) client_id=%s", client_id)
-            return
-        # Cross-process guard
-        if not _idempotent_claim(client_id):
-            return
-        _SENT_CLIENT_IDS.add(client_id)
+    if not _claim_client_id(client_id):
+        return
 
     ex, info = _mk_clients()
     price_tick, size_step, min_sz = _get_asset_meta(info, coin)
@@ -232,24 +344,34 @@ def submit_signal(sig) -> None:
     size = _quantize_down(raw_size, size_step)
 
     if min_sz is not None and size < min_sz:
-        log.info("[HL] SKIP: computed size %.10f < min size %.10f for %s", size, min_sz, coin)
+        log.info("[HL] SKIP: size %.10f < min %.10f for %s", size, min_sz, coin)
         return
     if size <= 0.0:
         log.info("[HL] SKIP: non-positive size after rounding: %.10f (coin=%s)", size, coin)
         return
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
+    is_buy = (side == "BUY")
+
+    # Safety net: if an equivalent order is already open, bail out
+    try:
+        for o in _iter_open_orders(info):
+            if _order_matches(o, coin=coin, is_buy=is_buy, limit_px=limit_px, size=size):
+                log.info("[HL] SKIP: identical open order already exists on book: %s", o)
+                return
+    except Exception as e:
+        log.warning("[HL] open-order duplicate check failed (continuing): %s", e)
 
     log.info(
-        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.6f, %.6f) mid=%.6f pxTick=%g szStep=%g minSz=%s sz=%.10f SL=%s lev=%s TIF=%s",
+        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.6f, %.6f) mid=%.6f pxTick=%g szStep=%g minSz=%s sz=%.10f SL=%s lev=%s TIF=%s client_id=%s",
         side, symbol, coin, entry_low, entry_high, mid, price_tick, size_step,
         "None" if min_sz is None else f"{min_sz}", size, getattr(sig, "stop_loss", None),
-        getattr(sig, "leverage", None), tif
+        getattr(sig, "leverage", None), tif, client_id
     )
 
     order = {
         "coin": coin,
-        "is_buy": (side == "BUY"),
+        "is_buy": is_buy,
         "sz": float(size),
         "limit_px": float(limit_px),
         "order_type": _order_type_for_tif(tif),
