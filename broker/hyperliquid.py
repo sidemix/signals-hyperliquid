@@ -14,23 +14,22 @@ log.setLevel(logging.INFO)
 # ----- Config -----
 _ALLOWED = set(s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip())
 _DEFAULT_TIF = (os.getenv("HYPER_TIF", "Alo") or "").strip()  # Alo | Ioc | Gtc (PostOnly ~= Alo)
-_PRIVKEY = (os.getenv("HYPER_PRIVATE_KEY", "") or "").strip()  # 0x... (API wallet private key)
-_ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()  # 0x... (PUBLIC address)
+_PRIVKEY = (os.getenv("HYPER_PRIVATE_KEY", "") or "").strip()
+_ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
-_API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()  # optional override
+_API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()
 
 
 def _api_url() -> str:
     if _API_URL:
         return _API_URL
-    # Default to MAINNET; change to TESTNET_API_URL if you want testnet by default.
     return constants.MAINNET_API_URL
 
 
 @dataclass
 class ExecPlan:
-    side: str            # "BUY" | "SELL"
-    coin: str            # e.g. "BTC"
+    side: str
+    coin: str
     limit_px: float
     size: float
     tif: str | None
@@ -70,7 +69,6 @@ def _symbol_ok(symbol: str) -> bool:
 
 
 def _order_type_for_tif(tif: str | None) -> dict:
-    """SDK 0.20.x expects: {'limit': {'tif': 'Alo'|'Ioc'|'Gtc'}}; {} for plain limit."""
     if not tif:
         return {}
     t = tif.strip().lower()
@@ -83,19 +81,30 @@ def _order_type_for_tif(tif: str | None) -> dict:
     return {}
 
 
-# ----- Entry point the execution layer calls -----
+# ----- Core logic -----
+def _tick_size_for_coin(coin: str) -> float:
+    """Approximate tick sizes per coin. Adjust as needed."""
+    tick_map = {
+        "BTC": 0.5,
+        "ETH": 0.05,
+        "SOL": 0.001,
+        "LINK": 0.001,
+        "BNB": 0.01,
+        "AVAX": 0.001,
+        "PAXG": 0.1,
+        "SNX": 0.001,
+        "MNT": 0.001,
+        "CRV": 0.0001,
+    }
+    return tick_map.get(coin.upper(), 0.01)  # default fallback
+
+
+def _round_to_tick(value: float, tick: float) -> float:
+    """Round value to the nearest valid tick."""
+    return round(round(value / tick) * tick, 10)
+
+
 def submit_signal(sig) -> None:
-    """
-    sig:
-      side: 'LONG' | 'SHORT'
-      symbol: 'BTC/USD'
-      entry_low: float
-      entry_high: float
-      stop_loss: float | None
-      leverage: float | None
-      tif: str | None
-      notional_usd: float | None
-    """
     if sig is None:
         raise ValueError("submit_signal(sig): sig is None")
 
@@ -125,17 +134,20 @@ def submit_signal(sig) -> None:
     _override = getattr(sig, "notional_usd", None)
     notional = float(_override) if _override is not None else _DEFAULT_NOTIONAL
 
-    # --- FIXED: round to valid tick size (1e-5) ---
+    # --- FIXED: round size & price to valid increments ---
     raw_size = notional / limit_px
-    size = round(raw_size, 5)
+    size = round(raw_size, 5)  # round to 1e-5
     if size <= 0:
         raise ValueError(f"Computed trade size <= 0 for {symbol}: {raw_size}")
+
+    tick = _tick_size_for_coin(coin)
+    limit_px = _round_to_tick(limit_px, tick)
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
 
     log.info(
-        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.2f, %.2f) mid=%.2f sz=%.5f SL=%s lev=%s TIF=%s",
-        side, symbol, coin, entry_low, entry_high, limit_px, size,
+        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.2f, %.2f) mid=%.2f tick=%.4f sz=%.5f SL=%s lev=%s TIF=%s",
+        side, symbol, coin, entry_low, entry_high, limit_px, tick, size,
         getattr(sig, "stop_loss", None), getattr(sig, "leverage", None), tif
     )
 
