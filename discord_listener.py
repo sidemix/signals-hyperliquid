@@ -124,10 +124,10 @@ async def on_message(message: discord.Message):
         log.info("[EXEC] execute_signal returned: %s", resp)
 
         try:
-            ch = await client.fetch_channel(POST_CHANNEL_ID)
-            await ch.send(f"📤 Sent to Hyperliquid: `{parsed.side}` {parsed.symbol} band=({entry_low:.2f}, {entry_high:.2f})")
-        except Exception as e:
-            log.exception("[POST] Failed to send confirmation: %s", e)
+      #      ch = await client.fetch_channel(POST_CHANNEL_ID)
+ #           await ch.send(f"📤 Sent to Hyperliquid: `{parsed.side}` {parsed.symbol} band=({entry_low:.2f}, {entry_high:.2f})")
+    #    except Exception as e:
+    #        log.exception("[POST] Failed to send confirmation: %s", e)
 
     except Exception as e:
         log.exception("[RX] Unhandled error in on_message: %s", e)
