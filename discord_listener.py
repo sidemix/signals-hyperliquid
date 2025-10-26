@@ -1,8 +1,6 @@
-# discord_listener.py
 import os
-import logging
 import sys
-from collections import deque
+import logging
 
 from bootcheck import run_startup_checks
 run_startup_checks()
@@ -44,21 +42,17 @@ intents.message_content = True   # must also be enabled in Dev Portal
 intents.guilds = True
 client = discord.Client(intents=intents)
 
-# ---------- Duplicate message guard ----------
-_RECENT_IDS = deque(maxlen=1000)
-_RECENT_SET = set()
+# ---------- Strong duplicate guard (by Discord message ID) ----------
+_SEEN_MSG_IDS: set[int] = set()
 
 def _seen(msg_id: int) -> bool:
-    """Return True if we've processed this message id recently; else record and return False."""
-    if msg_id in _RECENT_SET:
+    """Return True if we've already processed this message id in this process."""
+    if msg_id in _SEEN_MSG_IDS:
         return True
-    _RECENT_SET.add(msg_id)
-    _RECENT_IDS.append(msg_id)
-    if len(_RECENT_IDS) == _RECENT_IDS.maxlen:
-        # prune oldest if the deque is at capacity
-        oldest = _RECENT_IDS[0]
-        if oldest in _RECENT_SET:
-            _RECENT_SET.discard(oldest)
+    _SEEN_MSG_IDS.add(msg_id)
+    # simple cap to keep memory bounded
+    if len(_SEEN_MSG_IDS) > 10000:
+        _SEEN_MSG_IDS.clear()
     return False
 
 def _coerce_entry_band(parsed) -> Tuple[Optional[float], Optional[float]]:
@@ -91,10 +85,6 @@ async def on_resumed():
     log.info("[GATEWAY] Session resumed.")
 
 @client.event
-async def on_error(event, *args, **kwargs):
-    log.exception("[EVENT ERROR] %s", event)
-
-@client.event
 async def on_message(message: discord.Message):
     try:
         if message.author == client.user or getattr(message.author, "bot", False):
@@ -102,7 +92,7 @@ async def on_message(message: discord.Message):
         if message.channel.id not in WATCH_CHANNEL_IDS:
             return
 
-        # ---- De-duplicate by message ID ----
+        # ---- Deduplicate by exact Discord message id ----
         if _seen(message.id):
             log.info("[RX] Duplicate message id=%s (skipping).", message.id)
             return
