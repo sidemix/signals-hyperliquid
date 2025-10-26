@@ -1,5 +1,6 @@
 # hyperliquid.py
 import os
+import sys
 import logging
 import sqlite3
 import time
@@ -11,8 +12,13 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
+# ---- Logging to stdout (so you see [HL] lines in Render)
 log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    log.addHandler(_h)
 log.propagate = False
 
 # ----- Config -----
@@ -146,10 +152,6 @@ def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
     return None
 
 def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float]]:
-    """
-    Returns (price_tick, size_step, min_size?) using Info metadata.
-    Uses safer fallbacks to avoid zeroing sizes on high-priced coins.
-    """
     price_tick = _FALLBACK_PRICE_TICK
     size_step = _FALLBACK_SIZE_STEP
     min_sz: Optional[float] = _FALLBACK_MIN_SIZE
@@ -158,7 +160,7 @@ def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float
     if asset:
         try:
             px_dec = int(asset.get("pxDecimals", asset.get("px_decimals", 2)))
-            sz_dec = int(asset.get("szDecimals", asset.get("sz_decimals", 3)))  # prefer 3 as safer default
+            sz_dec = int(asset.get("szDecimals", asset.get("sz_decimals", 3)))  # safer default 3
             price_tick = 10 ** (-px_dec) if px_dec >= 0 else price_tick
             size_step = 10 ** (-sz_dec) if sz_dec >= 0 else size_step
         except Exception:
@@ -329,7 +331,6 @@ def submit_signal(sig) -> None:
     entry_high = float(entry_high)
     mid = (entry_low + entry_high) / 2.0
 
-    # Build client_id early and claim BEFORE any network calls
     client_id = getattr(sig, "client_id", None)
     if not _claim_client_id(client_id):
         return
@@ -337,13 +338,25 @@ def submit_signal(sig) -> None:
     ex, info = _mk_clients()
     price_tick, size_step, min_sz = _get_asset_meta(info, coin)
 
+    # Base limit at mid
     limit_px = _quantize_down(mid, price_tick)
+
+    # ALO nudge: move 1 tick AWAY from crossing so PostOnly won't reject
+    tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
+    tif_map = _order_type_for_tif(tif)
+    if tif_map.get("limit", {}).get("tif") == "Alo":
+        if side == "BUY":
+            limit_px = _quantize_down(max(price_tick, limit_px - price_tick), price_tick)
+        else:  # SELL
+            limit_px = _quantize_down(limit_px + price_tick, price_tick)
+        log.info("[HL] ALO nudge applied: limit_px=%s tick=%s side=%s", limit_px, price_tick, side)
+
     override = getattr(sig, "notional_usd", None)
     notional = float(override) if override is not None else _DEFAULT_NOTIONAL
     raw_size = (notional / limit_px) if limit_px > 0 else 0.0
     size = _quantize_down(raw_size, size_step)
 
-    # Optional “minimum floor” to rescue zeroing due to rounding (uses fallback or min_sz)
+    # Floor rescue for rounding-to-zero
     min_floor = min_sz if min_sz is not None else (_FALLBACK_MIN_SIZE if _FALLBACK_MIN_SIZE is not None else 0.0)
     if size < min_floor and raw_size >= (min_floor if min_floor > 0 else _FALLBACK_SIZE_STEP):
         size = max(min_floor, _FALLBACK_SIZE_STEP)
@@ -357,10 +370,9 @@ def submit_signal(sig) -> None:
                  size, raw_size, size_step, coin, limit_px, notional)
         return
 
-    tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
     is_buy = (side == "BUY")
 
-    # Safety net: if an equivalent order is already open, bail out
+    # Safety net: skip if identical order already on book
     try:
         for o in _iter_open_orders(info):
             if _order_matches(o, coin=coin, is_buy=is_buy, limit_px=limit_px, size=size):
@@ -373,7 +385,7 @@ def submit_signal(sig) -> None:
         "[HL] PLAN side=%s symbol=%s coin=%s band=(%.6f, %.6f) mid=%.6f pxTick=%g szStep=%g minSz=%s sz=%.10f SL=%s lev=%s TIF=%s client_id=%s",
         side, symbol, coin, entry_low, entry_high, mid, price_tick, size_step,
         "None" if min_sz is None else f"{min_sz}", size, getattr(sig, "stop_loss", None),
-        getattr(sig, "leverage", None), tif, client_id
+        getattr(sig, "leverage", None), tif_map, client_id
     )
 
     order = {
@@ -381,7 +393,7 @@ def submit_signal(sig) -> None:
         "is_buy": is_buy,
         "sz": float(size),
         "limit_px": float(limit_px),
-        "order_type": _order_type_for_tif(tif),
+        "order_type": tif_map,
         "reduce_only": False,
         "client_id": client_id,
     }
@@ -389,6 +401,22 @@ def submit_signal(sig) -> None:
     log.info("[HL] SEND bulk_orders: %s", order)
     try:
         resp = ex.bulk_orders([order])
-        log.info("[HL] bulk_orders resp: %s", resp)
+        log.info("[HL] bulk_orders resp raw: %s", resp)
+
+        # Try to detect explicit rejections
+        try:
+            # SDKs vary; handle common shapes
+            if isinstance(resp, dict):
+                errs = resp.get("errors") or resp.get("error")
+                oks  = resp.get("data") or resp.get("success") or resp.get("orderResponses")
+                if errs:
+                    log.warning("[HL] REJECT by exchange: %s", errs)
+                elif isinstance(oks, list) and oks and isinstance(oks[0], dict):
+                    s = oks[0].get("status") or oks[0].get("result")
+                    if s and str(s).lower() not in ("ok", "accepted", "success"):
+                        log.warning("[HL] NON-OK order status: %s", s)
+        except Exception:
+            pass
+
     except Exception as e:
         log.exception("[HL] ERROR sending bulk_orders: %s", e)
