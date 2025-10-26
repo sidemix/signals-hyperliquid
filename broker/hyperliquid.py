@@ -22,10 +22,9 @@ _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
 _API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()
 
-# ---- Idempotency (cross-process) ----
-# Use a small SQLite DB to claim client_ids atomically across processes.
+# ---- Cross-process idempotency (SQLite) ----
 _IDEMP_DB_PATH = os.getenv("IDEMP_DB_PATH", "/tmp/hyper_idempotency.db")
-_IDEMP_TTL_SECS = int(os.getenv("IDEMP_TTL_SECS", "86400"))  # 1 day
+_IDEMP_TTL_SECS = int(os.getenv("IDEMP_TTL_SECS", "86400"))  # 24h
 
 def _idemp_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(_IDEMP_DB_PATH, timeout=10, isolation_level=None)  # autocommit
@@ -46,32 +45,31 @@ def _purge_old(conn: sqlite3.Connection, now: int) -> None:
         pass
 
 def _idempotent_claim(client_id: Optional[str]) -> bool:
-    """
-    Returns True if we successfully claim this client_id (first sender),
-    False if it was already claimed by this or another process.
-    """
+    """Atomically claim a client_id. True = first sender, False = duplicate."""
     if not client_id:
-        return True  # nothing to dedupe on
-    now = int(time.time())
+        return True
+    conn = None
     try:
+        now = int(time.time())
         conn = _idemp_conn()
         _purge_old(conn, now)
-        # Attempt to insert; if exists, UNIQUE constraint fails -> already claimed.
         conn.execute("INSERT INTO sent_client_ids (client_id, ts) VALUES (?, ?)", (client_id, now))
+        log.info("[HL] IDEMP: claimed client_id=%s", client_id)
         return True
     except sqlite3.IntegrityError:
+        log.info("[HL] SKIP duplicate (cross-process) client_id=%s", client_id)
         return False
     except Exception as e:
-        # If DB has an issue, log and fall back to best-effort (allow send once).
-        log.exception("[HL] Idempotency DB error, proceeding without cross-process guard: %s", e)
+        log.exception("[HL] Idempotency DB error (proceeding best-effort): %s", e)
         return True
     finally:
         try:
-            conn.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
 
-# Per-process (in-memory) guard (prevents double send in same process)
+# Per-process guard (same interpreter)
 _SENT_CLIENT_IDS: set[str] = set()
 
 def _api_url() -> str:
@@ -130,17 +128,14 @@ def _quantize_down(x: float, step: float) -> float:
 
 # ---- Robust asset metadata resolution across SDK layouts ----
 def _try_get_assets_container(info: Info) -> Optional[Any]:
-    # 1) known attribute
     cont = getattr(info, "assets", None)
     if isinstance(cont, (list, tuple)) and cont and isinstance(cont[0], dict):
         return cont
-    # 2) maybe under meta
     meta = getattr(info, "meta", None)
     if isinstance(meta, dict):
         cont = meta.get("assets")
         if isinstance(cont, (list, tuple)) and cont and isinstance(cont[0], dict):
             return cont
-    # 3) scan __dict__ for a list of dicts with pxDecimals key
     try:
         for v in info.__dict__.values():
             if isinstance(v, (list, tuple)) and v and isinstance(v[0], dict) and "pxDecimals" in v[0]:
@@ -150,18 +145,15 @@ def _try_get_assets_container(info: Info) -> Optional[Any]:
     return None
 
 def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
-    # name_to_asset may return dict OR int (asset id)
     try:
         res = info.name_to_asset(coin)
-        if isinstance(res, dict):
-            return res
+        if isinstance(res, dict): return res
         if isinstance(res, int):
             container = _try_get_assets_container(info)
             if container and 0 <= res < len(container):
                 return container[res]
     except Exception:
         pass
-    # Fallback: search by name/symbol/token
     container = _try_get_assets_container(info)
     if isinstance(container, (list, tuple)):
         for d in container:
@@ -171,16 +163,9 @@ def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
     return None
 
 def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float]]:
-    """
-    Returns (price_tick, size_step, min_size?) using Info metadata.
-    Safe for SDKs where name_to_asset returns dict OR int.
-    Falls back to conservative defaults if not found.
-    """
-    # defaults that are safe on many markets, especially low-priced perps
     price_tick = 0.01
     size_step = 1.0
     min_sz: Optional[float] = None
-
     asset = _resolve_asset_dict(info, coin)
     if asset:
         try:
@@ -197,7 +182,6 @@ def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float
                 except Exception:
                     pass
                 break
-
     return price_tick, size_step, min_sz
 
 # ---------- Main ----------
@@ -225,17 +209,16 @@ def submit_signal(sig) -> None:
     entry_high = float(entry_high)
     mid = (entry_low + entry_high) / 2.0
 
-    # Build client_id early and do idempotency claim BEFORE creating network clients.
+    # Build client_id as early as possible and claim it BEFORE network calls
     client_id = getattr(sig, "client_id", None)
 
-    # In-memory process-level guard
+    # Process-local guard
     if client_id:
         if client_id in _SENT_CLIENT_IDS:
-            log.info("[HL] SKIP duplicate (process-local) client_id: %s", client_id)
+            log.info("[HL] SKIP duplicate (process-local) client_id=%s", client_id)
             return
         # Cross-process guard
         if not _idempotent_claim(client_id):
-            log.info("[HL] SKIP duplicate (cross-process) client_id: %s", client_id)
             return
         _SENT_CLIENT_IDS.add(client_id)
 
