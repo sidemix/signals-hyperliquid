@@ -38,20 +38,19 @@ POST_CHANNEL_ID = int(os.getenv("POST_CHANNEL_ID", str(next(iter(WATCH_CHANNEL_I
 
 # ---------- Intents ----------
 intents = discord.Intents.default()
-intents.message_content = True   # must also be enabled in Dev Portal
+intents.message_content = True
 intents.guilds = True
 client = discord.Client(intents=intents)
 
-# ---------- Strong duplicate guard (by Discord message ID) ----------
+# ---------- Strong duplicate guard (per-process) ----------
 _SEEN_MSG_IDS: set[int] = set()
 
 def _seen(msg_id: int) -> bool:
-    """Return True if we've already processed this message id in this process."""
     if msg_id in _SEEN_MSG_IDS:
         return True
     _SEEN_MSG_IDS.add(msg_id)
-    # simple cap to keep memory bounded
-    if len(_SEEN_MSG_IDS) > 10000:
+    # keep memory bounded
+    if len(_SEEN_MSG_IDS) > 20000:
         _SEEN_MSG_IDS.clear()
     return False
 
@@ -81,18 +80,15 @@ async def on_connect():
     log.info("[GATEWAY] Connected to Discord gateway.")
 
 @client.event
-async def on_resumed():
-    log.info("[GATEWAY] Session resumed.")
-
-@client.event
 async def on_message(message: discord.Message):
     try:
+        # ignore self/bots and other channels
         if message.author == client.user or getattr(message.author, "bot", False):
             return
         if message.channel.id not in WATCH_CHANNEL_IDS:
             return
 
-        # ---- Deduplicate by exact Discord message id ----
+        # ---- dedupe by Discord message id BEFORE any parsing ----
         if _seen(message.id):
             log.info("[RX] Duplicate message id=%s (skipping).", message.id)
             return
@@ -110,14 +106,18 @@ async def on_message(message: discord.Message):
             log.info("[RX] Missing entry band after coercion: low=%s high=%s", entry_low, entry_high)
             return
 
+        # Set idempotency key so two processes can't double-open
+        setattr(parsed, "client_id", f"discord:{message.id}")
+
         log.info(
-            "[PARSER] side=%s symbol=%s band=(%.6f, %.6f) sl=%s lev=%s tif=%s",
+            "[PARSER] side=%s symbol=%s band=(%.6f, %.6f) sl=%s lev=%s tif=%s client_id=%s",
             getattr(parsed, "side", None),
             getattr(parsed, "symbol", None),
             entry_low, entry_high,
             getattr(parsed, "stop_loss", None),
             getattr(parsed, "leverage", None),
             getattr(parsed, "tif", None),
+            getattr(parsed, "client_id", None),
         )
 
         resp = execute_signal(parsed)
