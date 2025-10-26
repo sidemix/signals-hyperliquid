@@ -1,4 +1,3 @@
-# broker/hyperliquid.py
 import os
 import logging
 from dataclasses import dataclass
@@ -21,7 +20,7 @@ _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
 _API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()
 
-# Per-process client_id guard
+# Per-process idempotency guard (prevents double send in same process)
 _SENT_CLIENT_IDS: set[str] = set()
 
 def _api_url() -> str:
@@ -68,12 +67,9 @@ def _order_type_for_tif(tif: Optional[str]) -> dict:
     if not tif:
         return {}
     t = tif.strip().lower()
-    if t in ("postonly", "alo"):
-        return {"limit": {"tif": "Alo"}}
-    if t == "ioc":
-        return {"limit": {"tif": "Ioc"}}
-    if t == "gtc":
-        return {"limit": {"tif": "Gtc"}}
+    if t in ("postonly", "alo"): return {"limit": {"tif": "Alo"}}
+    if t == "ioc":               return {"limit": {"tif": "Ioc"}}
+    if t == "gtc":               return {"limit": {"tif": "Gtc"}}
     return {}
 
 def _quantize_down(x: float, step: float) -> float:
@@ -81,21 +77,19 @@ def _quantize_down(x: float, step: float) -> float:
         return x
     return (int(x / step)) * step
 
+# ---- Robust asset metadata resolution across SDK layouts ----
 def _try_get_assets_container(info: Info) -> Optional[Any]:
-    """
-    Try to find the array of asset dicts inside Info across SDK layouts.
-    """
-    # known layouts to try
-    for attr in ("assets", ):
-        cont = getattr(info, attr, None)
-        if isinstance(cont, (list, tuple)) and cont and isinstance(cont[0], dict):
-            return cont
+    # 1) known attribute
+    cont = getattr(info, "assets", None)
+    if isinstance(cont, (list, tuple)) and cont and isinstance(cont[0], dict):
+        return cont
+    # 2) maybe under meta
     meta = getattr(info, "meta", None)
     if isinstance(meta, dict):
-        assets = meta.get("assets")
-        if isinstance(assets, (list, tuple)) and assets and isinstance(assets[0], dict):
-            return assets
-    # Last resort: info.__dict__ scan
+        cont = meta.get("assets")
+        if isinstance(cont, (list, tuple)) and cont and isinstance(cont[0], dict):
+            return cont
+    # 3) scan __dict__ for a list of dicts with pxDecimals key
     try:
         for v in info.__dict__.values():
             if isinstance(v, (list, tuple)) and v and isinstance(v[0], dict) and "pxDecimals" in v[0]:
@@ -105,39 +99,35 @@ def _try_get_assets_container(info: Info) -> Optional[Any]:
     return None
 
 def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
-    """
-    Resolve an asset dict for `coin` robustly. Handles SDKs where name_to_asset()
-    returns a dict OR an int (asset id).
-    """
-    asset = None
+    # name_to_asset may return dict OR int (asset id)
     try:
-        a = info.name_to_asset(coin)
-        if isinstance(a, dict):
-            return a
-        if isinstance(a, int):
+        res = info.name_to_asset(coin)
+        if isinstance(res, dict):
+            return res
+        if isinstance(res, int):
             container = _try_get_assets_container(info)
-            if container and 0 <= a < len(container):
-                return container[a]
+            if container and 0 <= res < len(container):
+                return container[res]
     except Exception:
         pass
-
-    # Fallback: scan any assets list for matching name
+    # Fallback: search by name/symbol/token
     container = _try_get_assets_container(info)
     if isinstance(container, (list, tuple)):
         for d in container:
             nm = d.get("name") or d.get("token") or d.get("symbol")
             if isinstance(nm, str) and nm.upper() == coin.upper():
                 return d
-    return asset
+    return None
 
 def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float]]:
     """
     Returns (price_tick, size_step, min_size?) using Info metadata.
-    Safe across SDK variations; falls back to conservative defaults.
+    Safe for SDKs where name_to_asset returns dict OR int.
+    Falls back to conservative defaults if not found.
     """
-    # Defaults that won't violate precision on most markets
+    # defaults that are safe on many markets, especially low-priced perps
     price_tick = 0.01
-    size_step = 1.0   # many low-cap perps require integer size
+    size_step = 1.0
     min_sz: Optional[float] = None
 
     asset = _resolve_asset_dict(info, coin)
@@ -210,7 +200,7 @@ def submit_signal(sig) -> None:
         getattr(sig, "leverage", None), tif
     )
 
-    # Per-process idempotency: if we already sent this client_id, skip
+    # Per-process idempotency: guard duplicates in the same process
     if client_id:
         if client_id in _SENT_CLIENT_IDS:
             log.info("[HL] SKIP duplicate client_id already submitted: %s", client_id)
