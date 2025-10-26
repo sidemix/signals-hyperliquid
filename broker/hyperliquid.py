@@ -19,11 +19,13 @@ _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()  # 0x... (PUBL
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
 _API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()  # optional override
 
+
 def _api_url() -> str:
     if _API_URL:
         return _API_URL
     # Default to MAINNET; change to TESTNET_API_URL if you want testnet by default.
     return constants.MAINNET_API_URL
+
 
 @dataclass
 class ExecPlan:
@@ -33,6 +35,7 @@ class ExecPlan:
     size: float
     tif: str | None
     reduce_only: bool = False
+
 
 # ----- Helpers -----
 def _require_signer():
@@ -45,6 +48,7 @@ def _require_signer():
     except Exception as e:
         raise RuntimeError(f"Invalid HYPER_PRIVATE_KEY: {e}")
 
+
 def _mk_clients() -> tuple[Exchange, Info]:
     signer = _require_signer()
     url = _api_url()
@@ -52,8 +56,10 @@ def _mk_clients() -> tuple[Exchange, Info]:
     info = Info(url, skip_ws=True)
     return ex, info
 
+
 def _coin_from_symbol(symbol: str) -> str:
     return (symbol or "").split("/")[0].upper()
+
 
 def _symbol_ok(symbol: str) -> bool:
     if not _ALLOWED:
@@ -61,6 +67,7 @@ def _symbol_ok(symbol: str) -> bool:
     sym_up = (symbol or "").upper()
     coin = _coin_from_symbol(symbol)
     return sym_up in _ALLOWED or coin in _ALLOWED
+
 
 def _order_type_for_tif(tif: str | None) -> dict:
     """SDK 0.20.x expects: {'limit': {'tif': 'Alo'|'Ioc'|'Gtc'}}; {} for plain limit."""
@@ -74,6 +81,7 @@ def _order_type_for_tif(tif: str | None) -> dict:
     if t == "gtc":
         return {"limit": {"tif": "Gtc"}}
     return {}
+
 
 # ----- Entry point the execution layer calls -----
 def submit_signal(sig) -> None:
@@ -116,12 +124,17 @@ def submit_signal(sig) -> None:
     # --- FIXED: handle None safely ---
     _override = getattr(sig, "notional_usd", None)
     notional = float(_override) if _override is not None else _DEFAULT_NOTIONAL
-    size = notional / limit_px
+
+    # --- FIXED: round to valid tick size (1e-5) ---
+    raw_size = notional / limit_px
+    size = round(raw_size, 5)
+    if size <= 0:
+        raise ValueError(f"Computed trade size <= 0 for {symbol}: {raw_size}")
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
 
     log.info(
-        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.2f, %.2f) mid=%.2f sz=%.4f SL=%s lev=%s TIF=%s",
+        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.2f, %.2f) mid=%.2f sz=%.5f SL=%s lev=%s TIF=%s",
         side, symbol, coin, entry_low, entry_high, limit_px, size,
         getattr(sig, "stop_loss", None), getattr(sig, "leverage", None), tif
     )
