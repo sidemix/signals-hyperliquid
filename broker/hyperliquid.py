@@ -1,3 +1,4 @@
+# hyperliquid.py
 import os
 import logging
 import sqlite3
@@ -9,23 +10,6 @@ from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-
-# Optional Redis (for cross-container idempotency)
-_IDEMP_REDIS_URL = os.getenv("IDEMP_REDIS_URL", "").strip()
-_redis = None
-if _IDEMP_REDIS_URL:
-    try:
-        import redis  # pip install redis
-        _redis = redis.Redis.from_url(_IDEMP_REDIS_URL, decode_responses=True)
-    except Exception as _e:
-        _redis = None
-
-# Optional fcntl file lock (Linux)
-_filelock_supported = True
-try:
-    import fcntl  # not on Windows
-except Exception:
-    _filelock_supported = False
 
 log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
@@ -39,10 +23,33 @@ _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
 _API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()
 
-# ---- Idempotency storage ----
+# Safer fallbacks so high-price coins don't zero out
+_FALLBACK_PRICE_TICK = float(os.getenv("HYPER_FALLBACK_PRICE_TICK", "0.01"))
+_FALLBACK_SIZE_STEP  = float(os.getenv("HYPER_FALLBACK_SIZE_STEP",  "0.001"))
+_FALLBACK_MIN_SIZE   = os.getenv("HYPER_FALLBACK_MIN_SIZE", "").strip()
+_FALLBACK_MIN_SIZE   = float(_FALLBACK_MIN_SIZE) if _FALLBACK_MIN_SIZE else None
+
+# ---- Idempotency storage (SQLite; good inside one container)
 _IDEMP_TTL_SECS = int(os.getenv("IDEMP_TTL_SECS", "86400"))  # 24h
 _IDEMP_DB_PATH = os.getenv("IDEMP_DB_PATH", "/tmp/hyper_idempotency.db")
 _IDEMP_LOCKFILE = os.getenv("IDEMP_LOCKFILE", "/tmp/hyper_idempotency.lock")
+
+# Optional Redis (for cross-container idempotency)
+_IDEMP_REDIS_URL = os.getenv("IDEMP_REDIS_URL", "").strip()
+_redis = None
+if _IDEMP_REDIS_URL:
+    try:
+        import redis
+        _redis = redis.Redis.from_url(_IDEMP_REDIS_URL, decode_responses=True)
+    except Exception:
+        _redis = None
+
+# Optional file lock (Linux)
+_filelock_supported = True
+try:
+    import fcntl
+except Exception:
+    _filelock_supported = False
 
 # Process-local guard
 _SENT_CLIENT_IDS: set[str] = set()
@@ -113,7 +120,7 @@ def _try_get_assets_container(info: Info) -> Optional[Any]:
             return cont
     try:
         for v in info.__dict__.values():
-            if isinstance(v, (list, tuple)) and v and isinstance(v[0], dict) and "pxDecimals" in v[0]:
+            if isinstance(v, (list, tuple)) and v and isinstance(v[0], dict) and ("pxDecimals" in v[0] or "px_decimals" in v[0]):
                 return v
     except Exception:
         pass
@@ -139,14 +146,19 @@ def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
     return None
 
 def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float]]:
-    price_tick = 0.01
-    size_step = 1.0
-    min_sz: Optional[float] = None
+    """
+    Returns (price_tick, size_step, min_size?) using Info metadata.
+    Uses safer fallbacks to avoid zeroing sizes on high-priced coins.
+    """
+    price_tick = _FALLBACK_PRICE_TICK
+    size_step = _FALLBACK_SIZE_STEP
+    min_sz: Optional[float] = _FALLBACK_MIN_SIZE
+
     asset = _resolve_asset_dict(info, coin)
     if asset:
         try:
             px_dec = int(asset.get("pxDecimals", asset.get("px_decimals", 2)))
-            sz_dec = int(asset.get("szDecimals", asset.get("sz_decimals", 0)))
+            sz_dec = int(asset.get("szDecimals", asset.get("sz_decimals", 3)))  # prefer 3 as safer default
             price_tick = 10 ** (-px_dec) if px_dec >= 0 else price_tick
             size_step = 10 ** (-sz_dec) if sz_dec >= 0 else size_step
         except Exception:
@@ -158,6 +170,7 @@ def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float
                 except Exception:
                     pass
                 break
+
     return price_tick, size_step, min_sz
 
 # ---------- Idempotency (Redis → SQLite+lock) ----------
@@ -214,26 +227,22 @@ def _sqlite_claim(client_id: str) -> bool:
             pass
         if _filelock_supported and lockf:
             try:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-                lockf.close()
+                fcntl.flock(lockf, fcntl.LOCK_UN); lockf.close()
             except Exception:
                 pass
 
 def _claim_client_id(client_id: Optional[str]) -> bool:
     if not client_id:
         return True
-    # Process-local fast path
     if client_id in _SENT_CLIENT_IDS:
         log.info("[HL] SKIP duplicate (process) %s", client_id)
         return False
-    # Cross-container Redis first
     res = _redis_claim(client_id)
     if res is True:
         _SENT_CLIENT_IDS.add(client_id)
         return True
     if res is False:
         return False
-    # Fallback to SQLite+lock
     if _sqlite_claim(client_id):
         _SENT_CLIENT_IDS.add(client_id)
         return True
@@ -241,11 +250,6 @@ def _claim_client_id(client_id: Optional[str]) -> bool:
 
 # ---------- Open-order duplicate check ----------
 def _iter_open_orders(info: Info) -> Iterable[dict]:
-    """
-    Tries several SDK layouts to yield open order dicts with keys:
-    coin, isBuy/is_buy, px/price, sz/size, reduceOnly/reduce_only, clientId/client_id
-    """
-    # 1) direct call
     for attr in ("open_orders", "user_open_orders"):
         fn = getattr(info, attr, None)
         if callable(fn):
@@ -262,7 +266,6 @@ def _iter_open_orders(info: Info) -> Iterable[dict]:
                                 if isinstance(x, dict): yield x
             except Exception:
                 pass
-    # 2) user_state blob
     state = None
     for attr in ("user_state", "userState", "account_state", "accountState"):
         fn = getattr(info, attr, None)
@@ -287,17 +290,14 @@ def _order_matches(o: dict, coin: str, is_buy: bool, limit_px: float, size: floa
         o_sz = o.get("sz", o.get("size"))
         if isinstance(o_isbuy, str):
             o_isbuy = o_isbuy.lower() in ("true", "1", "yes", "buy", "long")
-        # normalize floats
         o_px = float(o_px) if o_px is not None else None
         o_sz = float(o_sz) if o_sz is not None else None
         if (o_coin or "").upper() != coin.upper():
             return False
         if bool(o_isbuy) != bool(is_buy):
             return False
-        # exact px match or within 1 tick (server rounding)
         if o_px is None or abs(o_px - float(limit_px)) > 1e-12:
             return False
-        # accept slight sz round
         if o_sz is None or abs(o_sz - float(size)) > 1e-9:
             return False
         return True
@@ -343,11 +343,18 @@ def submit_signal(sig) -> None:
     raw_size = (notional / limit_px) if limit_px > 0 else 0.0
     size = _quantize_down(raw_size, size_step)
 
+    # Optional “minimum floor” to rescue zeroing due to rounding (uses fallback or min_sz)
+    min_floor = min_sz if min_sz is not None else (_FALLBACK_MIN_SIZE if _FALLBACK_MIN_SIZE is not None else 0.0)
+    if size < min_floor and raw_size >= (min_floor if min_floor > 0 else _FALLBACK_SIZE_STEP):
+        size = max(min_floor, _FALLBACK_SIZE_STEP)
+
     if min_sz is not None and size < min_sz:
-        log.info("[HL] SKIP: size %.10f < min %.10f for %s", size, min_sz, coin)
+        log.info("[HL] SKIP: size %.10f < min %.10f for %s (raw=%.10f step=%g px=%.6f notional=%.2f)",
+                 size, min_sz, coin, raw_size, size_step, limit_px, notional)
         return
     if size <= 0.0:
-        log.info("[HL] SKIP: non-positive size after rounding: %.10f (coin=%s)", size, coin)
+        log.info("[HL] SKIP: non-positive size %.10f (raw=%.10f step=%g coin=%s px=%.6f notional=%.2f)",
+                 size, raw_size, size_step, coin, limit_px, notional)
         return
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
