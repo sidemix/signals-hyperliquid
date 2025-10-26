@@ -17,7 +17,7 @@ class ExecSignal:
     tif: Optional[str] = None
     notional_usd: Optional[float] = None
     timeframe: Optional[str] = None
-    client_id: Optional[str] = None  # <-- important
+    client_id: Optional[str] = None  # idempotency key
 
 def execute_signal(sig: "ExecSignal"):
     log.info(
