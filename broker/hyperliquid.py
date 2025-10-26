@@ -13,7 +13,7 @@ log.setLevel(logging.INFO)
 
 # ----- Config -----
 _ALLOWED = set(s.strip().upper() for s in os.getenv("HYPER_ONLY_EXECUTE_SYMBOLS", "").split(",") if s.strip())
-_DEFAULT_TIF = (os.getenv("HYPER_TIF", "Alo") or "").strip()  # Alo | Ioc | Gtc  (PostOnly ~= Alo)
+_DEFAULT_TIF = (os.getenv("HYPER_TIF", "Alo") or "").strip()  # Alo | Ioc | Gtc (PostOnly ~= Alo)
 _PRIVKEY = (os.getenv("HYPER_PRIVATE_KEY", "") or "").strip()  # 0x... (API wallet private key)
 _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()  # 0x... (PUBLIC address)
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
@@ -113,7 +113,9 @@ def submit_signal(sig) -> None:
     if limit_px <= 0:
         raise ValueError(f"Computed limit_px <= 0 for {symbol}: {limit_px}")
 
-    notional = float(getattr(sig, "notional_usd", _DEFAULT_NOTIONAL))
+    # --- FIXED: handle None safely ---
+    _override = getattr(sig, "notional_usd", None)
+    notional = float(_override) if _override is not None else _DEFAULT_NOTIONAL
     size = notional / limit_px
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
@@ -134,6 +136,10 @@ def submit_signal(sig) -> None:
         "reduce_only": False,
         "client_id": None,
     }
+
     log.info("[HL] SEND bulk_orders: %s", order)
-    resp = ex.bulk_orders([order])
-    log.info("[HL] bulk_orders resp: %s", resp)
+    try:
+        resp = ex.bulk_orders([order])
+        log.info("[HL] bulk_orders resp: %s", resp)
+    except Exception as e:
+        log.exception("[HL] ERROR sending bulk_orders: %s", e)
