@@ -1,30 +1,21 @@
-import logging
-from dataclasses import dataclass
-from typing import Optional
-
-from broker.hyperliquid import submit_signal as hyper_submit
+import sys, logging
+root = logging.getLogger()
+if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    root.addHandler(h)
+root.setLevel(logging.INFO)
 
 log = logging.getLogger("execution")
+from hyperliquid import submit_signal as hl_submit
 
-@dataclass
-class ExecSignal:
-    side: str
-    symbol: str
-    entry_low: Optional[float]
-    entry_high: Optional[float]
-    stop_loss: Optional[float] = None
-    leverage: Optional[float] = None
-    tif: Optional[str] = None
-    notional_usd: Optional[float] = None
-    timeframe: Optional[str] = None
-    client_id: Optional[str] = None  # idempotency key
-
-def execute_signal(sig: "ExecSignal"):
-    log.info(
-        "[EXEC] Dispatching to Hyperliquid: side=%s symbol=%s band=(%s,%s) sl=%s lev=%s tf=%s client_id=%s",
-        sig.side, sig.symbol, sig.entry_low, sig.entry_high,
-        sig.stop_loss, sig.leverage, getattr(sig, "timeframe", None),
-        getattr(sig, "client_id", None),
-    )
-    hyper_submit(sig)
-    return "OK"
+def execute_signal(sig)->None:
+    try:
+        log.info("[EXEC] Dispatching to Hyperliquid: side=%s symbol=%s band=(%s,%s) sl=%s lev=%s tif=%s client_id=%s",
+                 getattr(sig,"side",None), getattr(sig,"symbol",None),
+                 getattr(sig,"entry_low",None), getattr(sig,"entry_high",None),
+                 getattr(sig,"stop_loss",None), getattr(sig,"leverage",None),
+                 getattr(sig,"tif",None), getattr(sig,"client_id",None))
+        hl_submit(sig)
+    except Exception as e:
+        log.exception("[EXEC] ERROR in execute_signal: %s", e); raise
