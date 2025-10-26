@@ -1,5 +1,7 @@
 import os
 import logging
+import sqlite3
+import time
 from dataclasses import dataclass
 from typing import Optional, Any
 
@@ -20,7 +22,56 @@ _ACCOUNT = (os.getenv("HYPER_ACCOUNT_ADDRESS", "") or "").strip()
 _DEFAULT_NOTIONAL = float(os.getenv("HYPER_NOTIONAL_USD", "50"))
 _API_URL = (os.getenv("HYPER_API_URL", "") or "").strip()
 
-# Per-process idempotency guard (prevents double send in same process)
+# ---- Idempotency (cross-process) ----
+# Use a small SQLite DB to claim client_ids atomically across processes.
+_IDEMP_DB_PATH = os.getenv("IDEMP_DB_PATH", "/tmp/hyper_idempotency.db")
+_IDEMP_TTL_SECS = int(os.getenv("IDEMP_TTL_SECS", "86400"))  # 1 day
+
+def _idemp_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_IDEMP_DB_PATH, timeout=10, isolation_level=None)  # autocommit
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sent_client_ids (
+            client_id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL
+        )
+    """)
+    return conn
+
+def _purge_old(conn: sqlite3.Connection, now: int) -> None:
+    try:
+        conn.execute("DELETE FROM sent_client_ids WHERE ts < ?", (now - _IDEMP_TTL_SECS,))
+    except Exception:
+        pass
+
+def _idempotent_claim(client_id: Optional[str]) -> bool:
+    """
+    Returns True if we successfully claim this client_id (first sender),
+    False if it was already claimed by this or another process.
+    """
+    if not client_id:
+        return True  # nothing to dedupe on
+    now = int(time.time())
+    try:
+        conn = _idemp_conn()
+        _purge_old(conn, now)
+        # Attempt to insert; if exists, UNIQUE constraint fails -> already claimed.
+        conn.execute("INSERT INTO sent_client_ids (client_id, ts) VALUES (?, ?)", (client_id, now))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        # If DB has an issue, log and fall back to best-effort (allow send once).
+        log.exception("[HL] Idempotency DB error, proceeding without cross-process guard: %s", e)
+        return True
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# Per-process (in-memory) guard (prevents double send in same process)
 _SENT_CLIENT_IDS: set[str] = set()
 
 def _api_url() -> str:
@@ -174,6 +225,20 @@ def submit_signal(sig) -> None:
     entry_high = float(entry_high)
     mid = (entry_low + entry_high) / 2.0
 
+    # Build client_id early and do idempotency claim BEFORE creating network clients.
+    client_id = getattr(sig, "client_id", None)
+
+    # In-memory process-level guard
+    if client_id:
+        if client_id in _SENT_CLIENT_IDS:
+            log.info("[HL] SKIP duplicate (process-local) client_id: %s", client_id)
+            return
+        # Cross-process guard
+        if not _idempotent_claim(client_id):
+            log.info("[HL] SKIP duplicate (cross-process) client_id: %s", client_id)
+            return
+        _SENT_CLIENT_IDS.add(client_id)
+
     ex, info = _mk_clients()
     price_tick, size_step, min_sz = _get_asset_meta(info, coin)
 
@@ -191,7 +256,6 @@ def submit_signal(sig) -> None:
         return
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
-    client_id = getattr(sig, "client_id", None)
 
     log.info(
         "[HL] PLAN side=%s symbol=%s coin=%s band=(%.6f, %.6f) mid=%.6f pxTick=%g szStep=%g minSz=%s sz=%.10f SL=%s lev=%s TIF=%s",
@@ -199,13 +263,6 @@ def submit_signal(sig) -> None:
         "None" if min_sz is None else f"{min_sz}", size, getattr(sig, "stop_loss", None),
         getattr(sig, "leverage", None), tif
     )
-
-    # Per-process idempotency: guard duplicates in the same process
-    if client_id:
-        if client_id in _SENT_CLIENT_IDS:
-            log.info("[HL] SKIP duplicate client_id already submitted: %s", client_id)
-            return
-        _SENT_CLIENT_IDS.add(client_id)
 
     order = {
         "coin": coin,
