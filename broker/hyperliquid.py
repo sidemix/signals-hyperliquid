@@ -1,7 +1,7 @@
-# broker/hyperliquid.py
 import os
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 from eth_account import Account
 from hyperliquid.exchange import Exchange
@@ -10,7 +10,6 @@ from hyperliquid.utils import constants
 
 log = logging.getLogger("broker.hyperliquid")
 log.setLevel(logging.INFO)
-# avoid duplicate logs via root handler
 log.propagate = False
 
 # ----- Config -----
@@ -33,15 +32,15 @@ class ExecPlan:
     coin: str
     limit_px: float
     size: float
-    tif: str | None
+    tif: Optional[str]
     reduce_only: bool = False
 
-# ----- Helpers -----
+# ---------- Helpers ----------
 def _require_signer():
     if not _PRIVKEY:
-        raise RuntimeError("Set HYPER_PRIVATE_KEY (0x... API wallet private key).")
+        raise RuntimeError("Set HYPER_PRIVATE_KEY (0x... private key).")
     if not _ACCOUNT:
-        raise RuntimeError("Set HYPER_ACCOUNT_ADDRESS (your public address, 0x...).")
+        raise RuntimeError("Set HYPER_ACCOUNT_ADDRESS (0x... public address).")
     try:
         return Account.from_key(_PRIVKEY)
     except Exception as e:
@@ -64,7 +63,7 @@ def _symbol_ok(symbol: str) -> bool:
     coin = _coin_from_symbol(symbol)
     return sym_up in _ALLOWED or coin in _ALLOWED
 
-def _order_type_for_tif(tif: str | None) -> dict:
+def _order_type_for_tif(tif: Optional[str]) -> dict:
     if not tif:
         return {}
     t = tif.strip().lower()
@@ -76,13 +75,43 @@ def _order_type_for_tif(tif: str | None) -> dict:
         return {"limit": {"tif": "Gtc"}}
     return {}
 
-def _round_to_tick(value: float, tick: float) -> float:
-    return round(round(value / tick) * tick, 8)
+def _quantize_down(x: float, step: float) -> float:
+    if step <= 0:
+        return x
+    # floor to the grid
+    return (int(x / step)) * step
 
-def _round_size(value: float, step: float = 1e-5) -> float:
-    return round(round(value / step) * step, 8)
+def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float]]:
+    """
+    Returns (price_tick, size_step, min_size?) from Info metadata.
+    Falls back to sensible defaults if keys aren't present.
+    """
+    a = info.name_to_asset(coin)  # SDK expects the COIN (e.g., "BTC")
+    # Common fields are pxDecimals and szDecimals; min size might be "minSz" or similar.
+    try:
+        px_dec = int(a.get("pxDecimals", 0))
+    except Exception:
+        px_dec = 0
+    try:
+        sz_dec = int(a.get("szDecimals", 0))
+    except Exception:
+        sz_dec = 0
 
-# ----- Main Entry -----
+    price_tick = 10 ** (-px_dec) if px_dec > 0 else 1.0
+    size_step = 10 ** (-sz_dec) if sz_dec > 0 else 1.0
+
+    min_sz = None
+    for k in ("minSz", "minSize", "min_size"):
+        if k in a:
+            try:
+                min_sz = float(a[k])
+            except Exception:
+                pass
+            break
+
+    return price_tick, size_step, min_sz
+
+# ---------- Main ----------
 def submit_signal(sig) -> None:
     if sig is None:
         raise ValueError("submit_signal(sig): sig is None")
@@ -105,29 +134,35 @@ def submit_signal(sig) -> None:
     coin = _coin_from_symbol(symbol)
     entry_low = float(entry_low)
     entry_high = float(entry_high)
-    limit_mid = (entry_low + entry_high) / 2.0
+    mid = (entry_low + entry_high) / 2.0
 
-    # Price tick: simple default; expand as needed or query Info() for exact metadata
-    tick = 0.5 if coin == "BTC" else 0.01
-    limit_px = _round_to_tick(limit_mid, tick)
-    if limit_px <= 0:
-        raise ValueError(f"Computed limit_px <= 0 for {symbol}: {limit_px}")
+    # Create clients and fetch asset meta
+    ex, info = _mk_clients()
+    price_tick, size_step, min_sz = _get_asset_meta(info, coin)
 
+    # Quantize price and compute size
+    limit_px = _quantize_down(mid, price_tick)
     override = getattr(sig, "notional_usd", None)
     notional = float(override) if override is not None else _DEFAULT_NOTIONAL
+    raw_size = notional / limit_px if limit_px > 0 else 0.0
+    size = _quantize_down(raw_size, size_step)
 
-    raw_size = notional / limit_px
-    size = _round_size(raw_size, 1e-5)
-    if size <= 0:
-        raise ValueError(f"Computed trade size <= 0 for {symbol}: {raw_size}")
+    # Enforce min size if provided
+    if min_sz is not None and size < min_sz:
+        log.info("[HL] SKIP: computed size %.10f < min size %.10f for %s", size, min_sz, coin)
+        return
+    if size <= 0.0:
+        log.info("[HL] SKIP: non-positive size after rounding: %.10f (coin=%s)", size, coin)
+        return
 
     tif = getattr(sig, "tif", None) or (_DEFAULT_TIF if _DEFAULT_TIF else None)
     client_id = getattr(sig, "client_id", None)
 
     log.info(
-        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.2f, %.2f) mid=%.2f tick=%.4f sz=%.5f SL=%s lev=%s TIF=%s",
-        side, symbol, coin, entry_low, entry_high, limit_px, tick, size,
-        getattr(sig, "stop_loss", None), getattr(sig, "leverage", None), tif
+        "[HL] PLAN side=%s symbol=%s coin=%s band=(%.6f, %.6f) mid=%.6f pxTick=%g szStep=%g minSz=%s sz=%.10f SL=%s lev=%s TIF=%s",
+        side, symbol, coin, entry_low, entry_high, mid, price_tick, size_step,
+        "None" if min_sz is None else f"{min_sz}", size, getattr(sig, "stop_loss", None),
+        getattr(sig, "leverage", None), tif
     )
 
     # Per-process idempotency: if we already sent this client_id, skip
@@ -137,8 +172,6 @@ def submit_signal(sig) -> None:
             return
         _SENT_CLIENT_IDS.add(client_id)
 
-    ex, _info = _mk_clients()
-
     order = {
         "coin": coin,
         "is_buy": (side == "BUY"),
@@ -146,7 +179,7 @@ def submit_signal(sig) -> None:
         "limit_px": float(limit_px),
         "order_type": _order_type_for_tif(tif),
         "reduce_only": False,
-        "client_id": client_id,  # pass through idempotency key
+        "client_id": client_id,
     }
 
     log.info("[HL] SEND bulk_orders: %s", order)
