@@ -3,7 +3,6 @@ import os
 import sys
 import time
 import logging
-import asyncio
 import sqlite3
 from typing import Optional
 
@@ -34,14 +33,13 @@ _PROCESSED_LOCAL: set[str] = set()
 # ---- Optional Redis (RECOMMENDED ACROSS MULTIPLE CONTAINERS)
 _IDEMP_REDIS_URL = os.getenv("IDEMP_REDIS_URL", "").strip()
 _redis = None
-_REDIS_REQUIRED = bool(_IDEMP_REDIS_URL)  # if set, we make Redis mandatory (no sqlite fallback)
+_REDIS_REQUIRED = bool(_IDEMP_REDIS_URL)  # if set, Redis is mandatory (no sqlite fallback)
 _REDIS_OK = False
 
 if _IDEMP_REDIS_URL:
     try:
         import redis  # ensure 'redis>=5.0.0' is in requirements.txt
         _redis = redis.Redis.from_url(_IDEMP_REDIS_URL, decode_responses=True)
-        # health check
         _redis.ping()
         _REDIS_OK = True
         log.info("[IDEMP] Redis connected ✓")
@@ -52,7 +50,7 @@ if _IDEMP_REDIS_URL:
 # ---- Optional file lock (Linux) for sqlite mode
 _filelock_supported = True
 try:
-    import fcntl  # not available on Windows
+    import fcntl  # not on Windows
 except Exception:
     _filelock_supported = False
 
@@ -170,7 +168,6 @@ class Listener(discord.Client):
         watching = ",".join(str(x) for x in WATCH_CHANNEL_IDS) or "<all?>"
         tag = f"{self.user}"
         try:
-            # discord.py v2 may not use discriminators
             disc = getattr(self.user, "discriminator", None)
             if disc and disc != "0":
                 tag = f"{self.user}#{disc}"
