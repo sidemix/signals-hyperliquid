@@ -44,7 +44,6 @@ _REDIS_OK = False
 if _IDEMP_REDIS_URL:
     try:
         import redis
-
         _redis = redis.Redis.from_url(_IDEMP_REDIS_URL, decode_responses=True)
         _redis.ping()
         _REDIS_OK = True
