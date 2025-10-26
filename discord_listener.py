@@ -1,5 +1,6 @@
 import os
 import sys
+import uuid
 import logging
 
 from bootcheck import run_startup_checks
@@ -13,22 +14,27 @@ from parser import parse_signal
 
 # ---------- Logging ----------
 root_level = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=root_level, stream=sys.stdout)
+# Configure once
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=root_level, stream=sys.stdout)
 log = logging.getLogger("discord_listener")
 logging.getLogger("discord").setLevel(root_level)
 logging.getLogger("discord.client").setLevel(root_level)
 logging.getLogger("discord.gateway").setLevel(root_level)
 logging.getLogger("discord.http").setLevel(root_level)
 
+# Unique id for this process (helps detect >1 instance)
+PROCESS_ID = os.getenv("INSTANCE_ID") or str(uuid.uuid4())[:8]
+
 # ---------- Env ----------
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is missing")
 
-watch_ids_env = os.getenv("WATCH_CHANNEL_IDS", "").strip()
+watch_ids_env = (os.getenv("WATCH_CHANNEL_IDS", "") or "").strip()
 WATCH_CHANNEL_IDS = {int(x.strip()) for x in watch_ids_env.split(",") if x.strip()}
 if not WATCH_CHANNEL_IDS:
-    t = os.getenv("TARGET_CHANNEL_ID", "").strip()
+    t = (os.getenv("TARGET_CHANNEL_ID", "") or "").strip()
     if t:
         WATCH_CHANNEL_IDS = {int(t)}
     else:
@@ -38,7 +44,7 @@ POST_CHANNEL_ID = int(os.getenv("POST_CHANNEL_ID", str(next(iter(WATCH_CHANNEL_I
 
 # ---------- Intents ----------
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True   # enable in Dev Portal too
 intents.guilds = True
 client = discord.Client(intents=intents)
 
@@ -46,6 +52,7 @@ client = discord.Client(intents=intents)
 _SEEN_MSG_IDS: set[int] = set()
 
 def _seen(msg_id: int) -> bool:
+    """Return True if we've already processed this message id in this process."""
     if msg_id in _SEEN_MSG_IDS:
         return True
     _SEEN_MSG_IDS.add(msg_id)
@@ -68,38 +75,35 @@ async def on_ready():
     try:
         ch = await client.fetch_channel(POST_CHANNEL_ID)
         log.info(
-            "[READY] Logged in as %s | watching=%s | posting-> #%s (%s)",
-            client.user, sorted(WATCH_CHANNEL_IDS), getattr(ch, "name", "?"), POST_CHANNEL_ID
+            "[READY][proc=%s] Logged in as %s | watching=%s | posting-> #%s (%s)",
+            PROCESS_ID, client.user, sorted(WATCH_CHANNEL_IDS), getattr(ch, "name", "?"), POST_CHANNEL_ID
         )
-        await ch.send("✅ Bot online. Watching channels: " + ", ".join(str(i) for i in sorted(WATCH_CHANNEL_IDS)))
+        # Silent mode: no public message in the channel
     except Exception as e:
-        log.exception("[READY] Failed to announce online: %s", e)
+        log.exception("[READY] Failed: %s", e)
 
 @client.event
 async def on_connect():
-    log.info("[GATEWAY] Connected to Discord gateway.")
+    log.info("[GATEWAY][proc=%s] Connected to Discord gateway.", PROCESS_ID)
 
 @client.event
 async def on_message(message: discord.Message):
     try:
-        # ---- ignore self/bots and other channels ----
+        # ignore self/bots and other channels
         if message.author == client.user or getattr(message.author, "bot", False):
             return
         if message.channel.id not in WATCH_CHANNEL_IDS:
             return
 
-        # ---- dedupe by Discord message id BEFORE any parsing ----
+        # dedupe by Discord message id BEFORE any parsing
         if _seen(message.id):
-            log.info("[RX] Duplicate message id=%s (skipping).", message.id)
+            log.info("[RX][proc=%s] Duplicate message id=%s (skipping).", PROCESS_ID, message.id)
             return
 
         content = message.content or ""
-        log.info(
-            "[RX] ch=%s by=%s id=%s len=%d",
-            message.channel.id, message.author, message.id, len(content)
-        )
+        log.info("[RX][proc=%s] ch=%s by=%s id=%s len=%d",
+                 PROCESS_ID, message.channel.id, message.author, message.id, len(content))
 
-        # ---- parse and validate the signal ----
         parsed = parse_signal(content)
         if not parsed:
             log.info("[RX] parse_signal returned None (skipping).")
@@ -110,11 +114,12 @@ async def on_message(message: discord.Message):
             log.info("[RX] Missing entry band after coercion: low=%s high=%s", entry_low, entry_high)
             return
 
-        # ---- attach client_id for deduplication ----
+        # Set idempotency key so two triggers can't double-open inside a process
         setattr(parsed, "client_id", f"discord:{message.id}")
 
         log.info(
-            "[PARSER] side=%s symbol=%s band=(%.6f, %.6f) sl=%s lev=%s tif=%s client_id=%s",
+            "[PARSER][proc=%s] side=%s symbol=%s band=(%.6f, %.6f) sl=%s lev=%s tif=%s client_id=%s",
+            PROCESS_ID,
             getattr(parsed, "side", None),
             getattr(parsed, "symbol", None),
             entry_low, entry_high,
@@ -124,23 +129,20 @@ async def on_message(message: discord.Message):
             getattr(parsed, "client_id", None),
         )
 
-        # ---- execute the parsed signal ----
+        # Execute (silent: no message posted to the channel)
         resp = execute_signal(parsed)
-        log.info("[EXEC] execute_signal returned: %s", resp)
+        log.info("[EXEC][proc=%s] execute_signal returned: %s", PROCESS_ID, resp)
 
-        # ✅ No public messages posted to Discord
-        # (Silent execution mode)
-        # If you want to DM yourself confirmation privately:
-        # if str(message.author.name).lower() == "tylerdefi":
+        # If you want a private DM to yourself, uncomment:
+        # if str(message.author.name).lower() == "yourname":
         #     await message.author.send(f"✅ Executed: {parsed.side} {parsed.symbol}")
 
     except Exception as e:
         log.exception("[RX] Unhandled error in on_message: %s", e)
 
-
 if __name__ == "__main__":
     try:
-        log.info("[BOOT] Starting Discord client…")
+        log.info("[BOOT][proc=%s] Starting Discord client…", PROCESS_ID)
         client.run(BOT_TOKEN, log_handler=None)
     except Exception as e:
         log.exception("[FATAL] client.run failed: %s", e)
