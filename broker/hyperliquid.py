@@ -152,15 +152,16 @@ def submit_signal(sig) -> None:
     )
 
     ex, _info = _mk_clients()
-    order = {
-        "coin": coin,
-        "is_buy": (side == "BUY"),
-        "sz": float(size),
-        "limit_px": float(limit_px),
-        "order_type": _order_type_for_tif(tif),
-        "reduce_only": False,
-        "client_id": None,
-    }
+order = {
+    "coin": coin,
+    "is_buy": (side == "BUY"),
+    "sz": float(size),
+    "limit_px": float(limit_px),
+    "order_type": _order_type_for_tif(tif),
+    "reduce_only": False,
+    "client_id": getattr(sig, "client_id", None),  # <-- must NOT be None if set in listener
+}
+
 
     log.info("[HL] SEND bulk_orders: %s", order)
     try:
