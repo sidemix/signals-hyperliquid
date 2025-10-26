@@ -82,7 +82,7 @@ async def on_connect():
 @client.event
 async def on_message(message: discord.Message):
     try:
-        # ignore self/bots and other channels
+        # ---- ignore self/bots and other channels ----
         if message.author == client.user or getattr(message.author, "bot", False):
             return
         if message.channel.id not in WATCH_CHANNEL_IDS:
@@ -94,8 +94,12 @@ async def on_message(message: discord.Message):
             return
 
         content = message.content or ""
-        log.info("[RX] ch=%s by=%s id=%s len=%d", message.channel.id, message.author, message.id, len(content))
+        log.info(
+            "[RX] ch=%s by=%s id=%s len=%d",
+            message.channel.id, message.author, message.id, len(content)
+        )
 
+        # ---- parse and validate the signal ----
         parsed = parse_signal(content)
         if not parsed:
             log.info("[RX] parse_signal returned None (skipping).")
@@ -106,7 +110,7 @@ async def on_message(message: discord.Message):
             log.info("[RX] Missing entry band after coercion: low=%s high=%s", entry_low, entry_high)
             return
 
-        # Set idempotency key so two processes can't double-open
+        # ---- attach client_id for deduplication ----
         setattr(parsed, "client_id", f"discord:{message.id}")
 
         log.info(
@@ -120,17 +124,19 @@ async def on_message(message: discord.Message):
             getattr(parsed, "client_id", None),
         )
 
+        # ---- execute the parsed signal ----
         resp = execute_signal(parsed)
         log.info("[EXEC] execute_signal returned: %s", resp)
 
-        try:
-      #      ch = await client.fetch_channel(POST_CHANNEL_ID)
- #           await ch.send(f"📤 Sent to Hyperliquid: `{parsed.side}` {parsed.symbol} band=({entry_low:.2f}, {entry_high:.2f})")
-    #    except Exception as e:
-    #        log.exception("[POST] Failed to send confirmation: %s", e)
+        # ✅ No public messages posted to Discord
+        # (Silent execution mode)
+        # If you want to DM yourself confirmation privately:
+        # if str(message.author.name).lower() == "tylerdefi":
+        #     await message.author.send(f"✅ Executed: {parsed.side} {parsed.symbol}")
 
     except Exception as e:
         log.exception("[RX] Unhandled error in on_message: %s", e)
+
 
 if __name__ == "__main__":
     try:
