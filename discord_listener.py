@@ -1,149 +1,233 @@
+# discord_listener.py
 import os
 import sys
-import uuid
+import time
 import logging
+import asyncio
+import sqlite3
+from typing import Optional
 
-from bootcheck import run_startup_checks
-run_startup_checks()
-
-from typing import Optional, Tuple
 import discord
 
-from execution import ExecSignal, execute_signal
+# ---- Optional Redis for cross-container idempotency
+_IDEMP_REDIS_URL = os.getenv("IDEMP_REDIS_URL", "").strip()
+_redis = None
+if _IDEMP_REDIS_URL:
+    try:
+        import redis  # make sure 'redis>=5.0.0' is in requirements.txt
+        _redis = redis.Redis.from_url(_IDEMP_REDIS_URL, decode_responses=True)
+    except Exception as e:
+        # Don't crash if Redis isn't reachable; we will fall back to SQLite.
+        _redis = None
+
+# ---- Optional file lock (Linux)
+_filelock_supported = True
+try:
+    import fcntl  # not available on Windows
+except Exception:
+    _filelock_supported = False
+
+# ---- Your code modules
+# Expect these modules to exist in your project:
+#  - parser.parse_signal(text) -> Sig or None
+#  - execution.execute_signal(sig) -> any
 from parser import parse_signal
+from execution import execute_signal
 
-# ---------- Logging ----------
-root_level = os.getenv("LOG_LEVEL", "INFO").upper()
-# Configure once
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=root_level, stream=sys.stdout)
+# ---- Logging
 log = logging.getLogger("discord_listener")
-logging.getLogger("discord").setLevel(root_level)
-logging.getLogger("discord.client").setLevel(root_level)
-logging.getLogger("discord.gateway").setLevel(root_level)
-logging.getLogger("discord.http").setLevel(root_level)
+log.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+if not log.handlers:
+    log.addHandler(handler)
+log.propagate = False
 
-# Unique id for this process (helps detect >1 instance)
-PROCESS_ID = os.getenv("INSTANCE_ID") or str(uuid.uuid4())[:8]
+# ---- Env
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+WATCH_CHANNEL_IDS = [s.strip() for s in (os.getenv("WATCH_CHANNEL_IDS", "") or "").split(",") if s.strip()]
+WATCH_CHANNEL_IDS = [int(x) for x in WATCH_CHANNEL_IDS if x.isdigit()]
 
-# ---------- Env ----------
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("DISCORD_BOT_TOKEN is missing")
+# Idempotency storage (listener level)
+_IDEMP_TTL_SECS = int(os.getenv("IDEMP_TTL_SECS", "604800"))  # 7 days by default
+_IDEMP_DB_PATH = os.getenv("IDEMP_DB_PATH", "/tmp/discord_idemp.db")
+_IDEMP_LOCKFILE = os.getenv("IDEMP_LOCKFILE", "/tmp/discord_idemp.lock")
 
-watch_ids_env = (os.getenv("WATCH_CHANNEL_IDS", "") or "").strip()
-WATCH_CHANNEL_IDS = {int(x.strip()) for x in watch_ids_env.split(",") if x.strip()}
-if not WATCH_CHANNEL_IDS:
-    t = (os.getenv("TARGET_CHANNEL_ID", "") or "").strip()
-    if t:
-        WATCH_CHANNEL_IDS = {int(t)}
-    else:
-        raise RuntimeError("Set WATCH_CHANNEL_IDS (comma-separated) or TARGET_CHANNEL_ID")
+# Process tag for logs
+_PROC_TAG = os.getenv("DYNO") or os.getenv("RENDER_INSTANCE_ID") or hex(abs(hash(os.getpid())) & 0xFFFFFFFF)[2:]
 
-POST_CHANNEL_ID = int(os.getenv("POST_CHANNEL_ID", str(next(iter(WATCH_CHANNEL_IDS)))))
+# In-process belt & suspenders
+_PROCESSED_LOCAL: set[str] = set()
 
-# ---------- Intents ----------
-intents = discord.Intents.default()
-intents.message_content = True   # enable in Dev Portal too
-intents.guilds = True
-client = discord.Client(intents=intents)
 
-# ---------- Strong duplicate guard (per-process) ----------
-_SEEN_MSG_IDS: set[int] = set()
+# =========================
+# Idempotency helpers
+# =========================
+def _redis_claim_msg(msg_id: str) -> Optional[bool]:
+    """Returns True if claimed, False if duplicate, None if Redis unavailable/error."""
+    if not _redis:
+        return None
+    try:
+        key = f"discord:msg:{msg_id}"
+        ok = _redis.set(name=key, value="1", nx=True, ex=_IDEMP_TTL_SECS)
+        if ok:
+            log.info("[IDEMP][redis] claimed message %s", msg_id)
+            return True
+        log.info("[IDEMP][redis] duplicate message %s -> skip", msg_id)
+        return False
+    except Exception as e:
+        log.exception("[IDEMP][redis] error (fallback to sqlite): %s", e)
+        return None
 
-def _seen(msg_id: int) -> bool:
-    """Return True if we've already processed this message id in this process."""
-    if msg_id in _SEEN_MSG_IDS:
+
+def _sqlite_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(_IDEMP_DB_PATH, timeout=10, isolation_level=None)  # autocommit
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_msgs (
+            msg_id TEXT PRIMARY KEY,
+            ts INTEGER NOT NULL
+        )
+    """)
+    return conn
+
+
+def _sqlite_claim_msg(msg_id: str) -> bool:
+    """Returns True if we inserted the msg_id (first), False if already there."""
+    now = int(time.time())
+    conn = None
+    lockf = None
+    try:
+        if _filelock_supported:
+            lockf = open(_IDEMP_LOCKFILE, "a+")
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+        conn = _sqlite_conn()
+        conn.execute("DELETE FROM processed_msgs WHERE ts < ?", (now - _IDEMP_TTL_SECS,))
+        conn.execute("INSERT INTO processed_msgs (msg_id, ts) VALUES (?, ?)", (msg_id, now))
+        log.info("[IDEMP][sqlite] claimed message %s", msg_id)
         return True
-    _SEEN_MSG_IDS.add(msg_id)
-    # keep memory bounded
-    if len(_SEEN_MSG_IDS) > 20000:
-        _SEEN_MSG_IDS.clear()
-    return False
-
-def _coerce_entry_band(parsed) -> Tuple[Optional[float], Optional[float]]:
-    low = getattr(parsed, "entry_low", None)
-    high = getattr(parsed, "entry_high", None)
-    try: low = float(low) if low is not None else None
-    except Exception: low = None
-    try: high = float(high) if high is not None else None
-    except Exception: high = None
-    return low, high
-
-@client.event
-async def on_ready():
-    try:
-        ch = await client.fetch_channel(POST_CHANNEL_ID)
-        log.info(
-            "[READY][proc=%s] Logged in as %s | watching=%s | posting-> #%s (%s)",
-            PROCESS_ID, client.user, sorted(WATCH_CHANNEL_IDS), getattr(ch, "name", "?"), POST_CHANNEL_ID
-        )
-        # Silent mode: no public message in the channel
+    except sqlite3.IntegrityError:
+        log.info("[IDEMP][sqlite] duplicate message %s -> skip", msg_id)
+        return False
     except Exception as e:
-        log.exception("[READY] Failed: %s", e)
+        # If SQLite is broken, allow one path to continue (avoid outage).
+        log.exception("[IDEMP][sqlite] error (best-effort proceed): %s", e)
+        return True
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        if _filelock_supported and lockf:
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+                lockf.close()
+            except Exception:
+                pass
 
-@client.event
-async def on_connect():
-    log.info("[GATEWAY][proc=%s] Connected to Discord gateway.", PROCESS_ID)
 
-@client.event
-async def on_message(message: discord.Message):
-    try:
-        # ignore self/bots and other channels
-        if message.author == client.user or getattr(message.author, "bot", False):
-            return
-        if message.channel.id not in WATCH_CHANNEL_IDS:
-            return
+def claim_discord_message(msg_id: str) -> bool:
+    """
+    Returns True if *this process* is the first to handle this Discord message, else False.
+    """
+    if not msg_id:
+        return True
+    if msg_id in _PROCESSED_LOCAL:
+        log.info("[IDEMP][proc] duplicate message %s -> skip", msg_id)
+        return False
 
-        # dedupe by Discord message id BEFORE any parsing
-        if _seen(message.id):
-            log.info("[RX][proc=%s] Duplicate message id=%s (skipping).", PROCESS_ID, message.id)
-            return
+    # Cross-container first (Redis)
+    r = _redis_claim_msg(msg_id)
+    if r is True:
+        _PROCESSED_LOCAL.add(msg_id)
+        return True
+    if r is False:
+        return False
 
-        content = message.content or ""
-        log.info("[RX][proc=%s] ch=%s by=%s id=%s len=%d",
-                 PROCESS_ID, message.channel.id, message.author, message.id, len(content))
+    # Fallback (same container) SQLite+file lock
+    ok = _sqlite_claim_msg(msg_id)
+    if ok:
+        _PROCESSED_LOCAL.add(msg_id)
+    return ok
 
-        parsed = parse_signal(content)
-        if not parsed:
-            log.info("[RX] parse_signal returned None (skipping).")
-            return
 
-        entry_low, entry_high = _coerce_entry_band(parsed)
-        if entry_low is None or entry_high is None:
-            log.info("[RX] Missing entry band after coercion: low=%s high=%s", entry_low, entry_high)
-            return
+# =========================
+# Discord client
+# =========================
+class Listener(discord.Client):
+    async def setup_hook(self) -> None:
+        log.info("[BOOT][proc=%s] Starting Discord client…", _PROC_TAG)
 
-        # Set idempotency key so two triggers can't double-open inside a process
-        setattr(parsed, "client_id", f"discord:{message.id}")
+    async def on_ready(self):
+        watching = ",".join(str(x) for x in WATCH_CHANNEL_IDS) or "<all?>"
+        log.info("[READY][proc=%s] Logged in as %s | watching=[%s]",
+                 _PROC_TAG, f"{self.user}#{self.user.discriminator if hasattr(self.user,'discriminator') else ''}", watching)
 
-        log.info(
-            "[PARSER][proc=%s] side=%s symbol=%s band=(%.6f, %.6f) sl=%s lev=%s tif=%s client_id=%s",
-            PROCESS_ID,
-            getattr(parsed, "side", None),
-            getattr(parsed, "symbol", None),
-            entry_low, entry_high,
-            getattr(parsed, "stop_loss", None),
-            getattr(parsed, "leverage", None),
-            getattr(parsed, "tif", None),
-            getattr(parsed, "client_id", None),
-        )
+    async def on_message(self, message: discord.Message):
+        try:
+            if message.author.bot:
+                return
+            if WATCH_CHANNEL_IDS and message.channel.id not in WATCH_CHANNEL_IDS:
+                return
 
-        # Execute (silent: no message posted to the channel)
-        resp = execute_signal(parsed)
-        log.info("[EXEC][proc=%s] execute_signal returned: %s", PROCESS_ID, resp)
+            msg_id = str(message.id)
+            ch = message.channel.id
+            author = getattr(message.author, "name", "unknown")
+            content_len = len(message.content or "")
+            log.info("[RX][proc=%s] ch=%s by=%s id=%s len=%s",
+                     _PROC_TAG, ch, author, msg_id, content_len)
 
-        # If you want a private DM to yourself, uncomment:
-        # if str(message.author.name).lower() == "yourname":
-        #     await message.author.send(f"✅ Executed: {parsed.side} {parsed.symbol}")
+            # *** CRITICAL: claim the message BEFORE parsing/executing ***
+            if not claim_discord_message(msg_id):
+                log.info("[EXEC][proc=%s] SKIP: already processed message_id=%s", _PROC_TAG, msg_id)
+                return
 
-    except Exception as e:
-        log.exception("[RX] Unhandled error in on_message: %s", e)
+            # Parse signal (your existing parser)
+            sig = parse_signal(message.content or "")
+            if not sig:
+                return
+
+            # Attach a stable client_id so downstream can also dedupe (good backstop)
+            try:
+                setattr(sig, "client_id", f"discord:{msg_id}")
+            except Exception:
+                pass
+
+            # Log the parsed signal similarly to your current style
+            try:
+                side = getattr(sig, "side", None)
+                symbol = getattr(sig, "symbol", None)
+                e_low = getattr(sig, "entry_low", None)
+                e_high = getattr(sig, "entry_high", None)
+                sl = getattr(sig, "stop_loss", None)
+                lev = getattr(sig, "leverage", None)
+                tif = getattr(sig, "tif", None)
+                log.info("[PARSER][proc=%s] side=%s symbol=%s band=(%s, %s) sl=%s lev=%s tif=%s client_id=%s",
+                         _PROC_TAG, side, symbol, e_low, e_high, sl, lev, tif, f"discord:{msg_id}")
+            except Exception:
+                pass
+
+            # Execute (your existing executor -> Hyperliquid)
+            execute_signal(sig)
+            log.info("[EXEC][proc=%s] execute_signal returned: OK", _PROC_TAG)
+
+        except Exception as e:
+            log.exception("[ERR][proc=%s] on_message failed: %s", _PROC_TAG, e)
+
+
+# =========================
+# Entrypoint
+# =========================
+def main():
+    if not DISCORD_BOT_TOKEN:
+        raise RuntimeError("Set DISCORD_BOT_TOKEN")
+    intents = discord.Intents.default()
+    intents.message_content = True  # required if bot has the Message Content intent
+    client = Listener(intents=intents)
+    client.run(DISCORD_BOT_TOKEN)
+
 
 if __name__ == "__main__":
-    try:
-        log.info("[BOOT][proc=%s] Starting Discord client…", PROCESS_ID)
-        client.run(BOT_TOKEN, log_handler=None)
-    except Exception as e:
-        log.exception("[FATAL] client.run failed: %s", e)
-        raise
+    main()
