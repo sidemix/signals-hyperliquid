@@ -103,7 +103,10 @@ class Listener(discord.Client):
             log.info("[RX][proc=%s] ch=%s by=%s id=%s len=%s", _PROC_TAG, message.channel.id, getattr(message.author,"name","?"), msg_id, len(message.content or ""))
             if not claim_discord_message(msg_id):
                 log.info("[EXEC][proc=%s] SKIP: already processed (or Redis unavailable) message_id=%s", _PROC_TAG, msg_id); return
-            sig=parse_signal(message.content or ""); if not sig: return
+            if not claim_discord_message(msg_id):
+            log.info("[EXEC][proc=%s] SKIP: already processed (or Redis unavailable) message_id=%s", _PROC_TAG, msg_id)
+            return
+
             try: setattr(sig,"client_id",f"discord:{msg_id}")
             except: pass
             log.info("[PARSER][proc=%s] side=%s symbol=%s band=(%s,%s) sl=%s lev=%s tif=%s client_id=%s",
