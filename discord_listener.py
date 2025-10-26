@@ -63,7 +63,6 @@ from execution import execute_signal
 # Idempotency helpers
 # =========================
 def _redis_claim_msg(msg_id: str) -> Optional[bool]:
-    """True=claimed, False=duplicate, None=redis unavailable/error."""
     if not (_redis and _REDIS_OK):
         return None
     try:
@@ -78,7 +77,6 @@ def _redis_claim_msg(msg_id: str) -> Optional[bool]:
         log.exception("[IDEMP][redis] error: %s", e)
         return None
 
-
 def _sqlite_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(_IDEMP_DB_PATH, timeout=10, isolation_level=None)  # autocommit
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -90,7 +88,6 @@ def _sqlite_conn() -> sqlite3.Connection:
         )
     """)
     return conn
-
 
 def _sqlite_claim_msg(msg_id: str) -> bool:
     now = int(time.time())
@@ -122,23 +119,13 @@ def _sqlite_claim_msg(msg_id: str) -> bool:
             except Exception:
                 pass
 
-
 def claim_discord_message(msg_id: str) -> bool:
-    """
-    Returns True if this process is the first to handle this Discord message; else False.
-    Behavior:
-      - If IDEMP_REDIS_URL is set: Redis is MANDATORY. If Redis not reachable in this pod, SKIP.
-      - If IDEMP_REDIS_URL is not set: use SQLite (single-container only).
-    """
     if not msg_id:
         return True
-
-    # Process-local fast path
     if msg_id in _PROCESSED_LOCAL:
         log.info("[IDEMP][proc] duplicate message %s -> skip", msg_id)
         return False
 
-    # Redis mode (mandatory when configured)
     if _REDIS_REQUIRED:
         r = _redis_claim_msg(msg_id)
         if r is True:
@@ -146,11 +133,9 @@ def claim_discord_message(msg_id: str) -> bool:
             return True
         if r is False:
             return False
-        # r is None -> Redis unavailable here -> SKIP to avoid duplicates
         log.warning("[IDEMP] Redis configured but unavailable in this pod; SKIPPING message %s", msg_id)
         return False
 
-    # SQLite mode (only when Redis not configured)
     ok = _sqlite_claim_msg(msg_id)
     if ok:
         _PROCESSED_LOCAL.add(msg_id)
@@ -189,24 +174,20 @@ class Listener(discord.Client):
             log.info("[RX][proc=%s] ch=%s by=%s id=%s len=%s",
                      _PROC_TAG, ch, author, msg_id, content_len)
 
-            # *** Claim BEFORE parsing/executing ***
             if not claim_discord_message(msg_id):
                 log.info("[EXEC][proc=%s] SKIP: already processed (or Redis unavailable) message_id=%s",
                          _PROC_TAG, msg_id)
                 return
 
-            # Parse signal
             sig = parse_signal(message.content or "")
             if not sig:
                 return
 
-            # Attach stable client_id for downstream HL module
             try:
                 setattr(sig, "client_id", f"discord:{msg_id}")
             except Exception:
                 pass
 
-            # Pretty log
             try:
                 side = getattr(sig, "side", None)
                 symbol = getattr(sig, "symbol", None)
@@ -220,7 +201,6 @@ class Listener(discord.Client):
             except Exception:
                 pass
 
-            # Execute
             execute_signal(sig)
             log.info("[EXEC][proc=%s] execute_signal returned: OK", _PROC_TAG)
 
@@ -228,9 +208,6 @@ class Listener(discord.Client):
             log.exception("[ERR][proc=%s] on_message failed: %s", _PROC_TAG, e)
 
 
-# =========================
-# Entrypoint
-# =========================
 def main():
     if not DISCORD_BOT_TOKEN:
         raise RuntimeError("Set DISCORD_BOT_TOKEN")
@@ -238,7 +215,6 @@ def main():
     intents.message_content = True
     client = Listener(intents=intents)
     client.run(DISCORD_BOT_TOKEN)
-
 
 if __name__ == "__main__":
     main()
