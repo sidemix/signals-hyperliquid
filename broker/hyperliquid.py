@@ -1,7 +1,8 @@
+# broker/hyperliquid.py
 import os
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 from eth_account import Account
 from hyperliquid.exchange import Exchange
@@ -78,36 +79,83 @@ def _order_type_for_tif(tif: Optional[str]) -> dict:
 def _quantize_down(x: float, step: float) -> float:
     if step <= 0:
         return x
-    # floor to the grid
     return (int(x / step)) * step
+
+def _try_get_assets_container(info: Info) -> Optional[Any]:
+    """
+    Try to find the array of asset dicts inside Info across SDK layouts.
+    """
+    # known layouts to try
+    for attr in ("assets", ):
+        cont = getattr(info, attr, None)
+        if isinstance(cont, (list, tuple)) and cont and isinstance(cont[0], dict):
+            return cont
+    meta = getattr(info, "meta", None)
+    if isinstance(meta, dict):
+        assets = meta.get("assets")
+        if isinstance(assets, (list, tuple)) and assets and isinstance(assets[0], dict):
+            return assets
+    # Last resort: info.__dict__ scan
+    try:
+        for v in info.__dict__.values():
+            if isinstance(v, (list, tuple)) and v and isinstance(v[0], dict) and "pxDecimals" in v[0]:
+                return v
+    except Exception:
+        pass
+    return None
+
+def _resolve_asset_dict(info: Info, coin: str) -> Optional[dict]:
+    """
+    Resolve an asset dict for `coin` robustly. Handles SDKs where name_to_asset()
+    returns a dict OR an int (asset id).
+    """
+    asset = None
+    try:
+        a = info.name_to_asset(coin)
+        if isinstance(a, dict):
+            return a
+        if isinstance(a, int):
+            container = _try_get_assets_container(info)
+            if container and 0 <= a < len(container):
+                return container[a]
+    except Exception:
+        pass
+
+    # Fallback: scan any assets list for matching name
+    container = _try_get_assets_container(info)
+    if isinstance(container, (list, tuple)):
+        for d in container:
+            nm = d.get("name") or d.get("token") or d.get("symbol")
+            if isinstance(nm, str) and nm.upper() == coin.upper():
+                return d
+    return asset
 
 def _get_asset_meta(info: Info, coin: str) -> tuple[float, float, Optional[float]]:
     """
-    Returns (price_tick, size_step, min_size?) from Info metadata.
-    Falls back to sensible defaults if keys aren't present.
+    Returns (price_tick, size_step, min_size?) using Info metadata.
+    Safe across SDK variations; falls back to conservative defaults.
     """
-    a = info.name_to_asset(coin)  # SDK expects the COIN (e.g., "BTC")
-    # Common fields are pxDecimals and szDecimals; min size might be "minSz" or similar.
-    try:
-        px_dec = int(a.get("pxDecimals", 0))
-    except Exception:
-        px_dec = 0
-    try:
-        sz_dec = int(a.get("szDecimals", 0))
-    except Exception:
-        sz_dec = 0
+    # Defaults that won't violate precision on most markets
+    price_tick = 0.01
+    size_step = 1.0   # many low-cap perps require integer size
+    min_sz: Optional[float] = None
 
-    price_tick = 10 ** (-px_dec) if px_dec > 0 else 1.0
-    size_step = 10 ** (-sz_dec) if sz_dec > 0 else 1.0
-
-    min_sz = None
-    for k in ("minSz", "minSize", "min_size"):
-        if k in a:
-            try:
-                min_sz = float(a[k])
-            except Exception:
-                pass
-            break
+    asset = _resolve_asset_dict(info, coin)
+    if asset:
+        try:
+            px_dec = int(asset.get("pxDecimals", asset.get("px_decimals", 2)))
+            sz_dec = int(asset.get("szDecimals", asset.get("sz_decimals", 0)))
+            price_tick = 10 ** (-px_dec) if px_dec >= 0 else price_tick
+            size_step = 10 ** (-sz_dec) if sz_dec >= 0 else size_step
+        except Exception:
+            pass
+        for k in ("minSz", "minSize", "min_size"):
+            if k in asset:
+                try:
+                    min_sz = float(asset[k])
+                except Exception:
+                    pass
+                break
 
     return price_tick, size_step, min_sz
 
@@ -136,18 +184,15 @@ def submit_signal(sig) -> None:
     entry_high = float(entry_high)
     mid = (entry_low + entry_high) / 2.0
 
-    # Create clients and fetch asset meta
     ex, info = _mk_clients()
     price_tick, size_step, min_sz = _get_asset_meta(info, coin)
 
-    # Quantize price and compute size
     limit_px = _quantize_down(mid, price_tick)
     override = getattr(sig, "notional_usd", None)
     notional = float(override) if override is not None else _DEFAULT_NOTIONAL
-    raw_size = notional / limit_px if limit_px > 0 else 0.0
+    raw_size = (notional / limit_px) if limit_px > 0 else 0.0
     size = _quantize_down(raw_size, size_step)
 
-    # Enforce min size if provided
     if min_sz is not None and size < min_sz:
         log.info("[HL] SKIP: computed size %.10f < min size %.10f for %s", size, min_sz, coin)
         return
